@@ -1,0 +1,972 @@
+"""Data access for pages, revisions, links and search."""
+
+from __future__ import annotations
+
+import difflib
+import gzip
+import hashlib
+import html
+import json
+import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import NamedTuple
+
+from . import markup
+from .config import Settings
+from .db import write_tx
+from .errors import (
+    ContentTooLarge,
+    EditConflict,
+    PageNotFound,
+    RedirectConflict,
+    RedirectNotFound,
+    RevisionNotFound,
+    SlugConflict,
+)
+from .delta import DeltaError, make_delta
+from .markup import STATUS_PAGE, STATUS_REDIRECT
+from .textstore import (
+    delete_texts,
+    encoded_delta_size,
+    is_delta,
+    is_packed,
+    load_text,
+    pack_into_blob,
+    replace_with_delta,
+    store_text,
+    storage_bytes,
+    stored_size,
+)
+
+#: Compaction keeps every Nth body whole so a read is at most one delta away.
+KEYFRAME_INTERVAL = 16
+
+#: Markers handed to FTS5 snippet(), swapped for <mark> after HTML-escaping.
+_HL_OPEN = "\x02"
+_HL_CLOSE = "\x03"
+_IN_CLAUSE_CHUNK = 400
+
+
+class LinkInfo(NamedTuple):
+    slug: str
+    exists: bool
+    #: True when the target is an old name rather than the page's own slug.
+    via_redirect: bool
+
+
+@dataclass(frozen=True)
+class PageView:
+    """A page plus the rendered form of one of its revisions."""
+
+    id: int
+    slug: str
+    title: str
+    created_at: str
+    updated_at: str
+    revision: sqlite3.Row
+    content: str
+    html: str
+    links: tuple[LinkInfo, ...]
+    #: Set when the caller asked for one of the page's old names.
+    redirected_from: str | None = None
+
+
+def _now() -> str:
+    # Milliseconds, so edits landing in the same second still sort deterministically.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _link_state(status: dict[str, str]) -> str:
+    """Fingerprint of how a body's links resolved.
+
+    Covers redirect-ness as well as existence, so pointing an old name
+    somewhere else invalidates the cached HTML too.
+    """
+    payload = json.dumps(sorted(status.items()), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _chunks(values: Sequence[str]):
+    for start in range(0, len(values), _IN_CLAUSE_CHUNK):
+        chunk = list(values[start : start + _IN_CLAUSE_CHUNK])
+        yield chunk, ",".join("?" * len(chunk))
+
+
+def resolve_links(conn: sqlite3.Connection, slugs: Sequence[str]) -> dict[str, str]:
+    """Classify link targets as a live page, an old name, or missing.
+
+    Old names count as existing: renaming a page must not turn every link
+    written against its previous name red.
+    """
+    unique = list(dict.fromkeys(slugs))
+    status: dict[str, str] = {}
+    for chunk, placeholders in _chunks(unique):
+        for row in conn.execute(f"SELECT slug FROM page WHERE slug IN ({placeholders})", chunk):
+            status[row["slug"]] = STATUS_PAGE
+
+    unresolved = [slug for slug in unique if slug not in status]
+    for chunk, placeholders in _chunks(unresolved):
+        rows = conn.execute(
+            f"SELECT from_slug FROM redirect WHERE from_slug IN ({placeholders})", chunk
+        )
+        for row in rows:
+            status[row["from_slug"]] = STATUS_REDIRECT
+    return status
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def _link_infos(slugs: Sequence[str], status: dict[str, str]) -> tuple[LinkInfo, ...]:
+    return tuple(
+        LinkInfo(slug, slug in status, status.get(slug) == STATUS_REDIRECT) for slug in slugs
+    )
+
+
+def render_revision(
+    conn: sqlite3.Connection,
+    rev_id: int,
+    content: str,
+    settings: Settings,
+    *,
+    cacheable: bool = True,
+) -> tuple[str, tuple[LinkInfo, ...]]:
+    """Render a revision, going through render_cache.
+
+    A cache hit is still checked against how the links resolve right now: the
+    body is immutable but a red link turns blue the moment its target is
+    created, and a live link becomes a redirect the moment its target is
+    renamed.
+
+    `cacheable` is false for historical revisions. Storing those made the cache
+    grow with the number of revisions ever *viewed*, which is unbounded; only a
+    page's current revision earns a row.
+    """
+    cached = conn.execute(
+        "SELECT html_gz, links_json, link_state FROM render_cache WHERE rev_id = ?", (rev_id,)
+    ).fetchone()
+    if cached is not None:
+        slugs: list[str] = json.loads(cached["links_json"])
+        status = resolve_links(conn, slugs)
+        if _link_state(status) == cached["link_state"]:
+            html = gzip.decompress(cached["html_gz"]).decode("utf-8")
+            return html, _link_infos(slugs, status)
+
+    rendered = markup.render(
+        content, lambda targets: resolve_links(conn, targets), settings.link_base
+    )
+    if cacheable:
+        try:
+            conn.execute(
+                """
+                INSERT INTO render_cache (rev_id, html_gz, links_json, link_state, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (rev_id) DO UPDATE SET
+                    html_gz = excluded.html_gz,
+                    links_json = excluded.links_json,
+                    link_state = excluded.link_state,
+                    created_at = excluded.created_at
+                """,
+                (
+                    rev_id,
+                    gzip.compress(rendered.html.encode("utf-8"), 6, mtime=0),
+                    json.dumps(list(rendered.slugs), ensure_ascii=False),
+                    _link_state(dict(rendered.status)),
+                    _now(),
+                ),
+            )
+        except sqlite3.OperationalError:
+            # Cache writes are best effort; a locked database must not fail a read.
+            pass
+    return rendered.html, _link_infos(rendered.slugs, dict(rendered.status))
+
+
+def _drop_stale_cache(conn: sqlite3.Connection, page_id: int, keep_rev_id: int) -> None:
+    """Keep at most one cached render per page."""
+    conn.execute(
+        "DELETE FROM render_cache WHERE rev_id IN "
+        "(SELECT id FROM revision WHERE page_id = ? AND id <> ?)",
+        (page_id, keep_rev_id),
+    )
+
+
+# --------------------------------------------------------------------------
+# lookups
+# --------------------------------------------------------------------------
+
+
+def _page_row(conn: sqlite3.Connection, slug: str) -> sqlite3.Row:
+    """The page living at exactly `slug`. Does not follow old names."""
+    row = conn.execute("SELECT * FROM page WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        raise PageNotFound(slug)
+    return row
+
+
+def _resolve_slug(conn: sqlite3.Connection, slug: str) -> tuple[sqlite3.Row, str | None]:
+    """Find the page at `slug`, following an old name if that is what it is.
+
+    Returns ``(page, redirected_from)``. Exactly one hop is possible: redirects
+    store a page id, so there is nothing to chain to.
+    """
+    row = conn.execute("SELECT * FROM page WHERE slug = ?", (slug,)).fetchone()
+    if row is not None:
+        return row, None
+
+    alias = conn.execute(
+        "SELECT to_page_id FROM redirect WHERE from_slug = ?", (slug,)
+    ).fetchone()
+    if alias is None:
+        raise PageNotFound(slug)
+    target = conn.execute("SELECT * FROM page WHERE id = ?", (alias["to_page_id"],)).fetchone()
+    if target is None:  # pragma: no cover - the FK cascade rules this out
+        raise PageNotFound(slug)
+    return target, slug
+
+
+def _revision_row(conn: sqlite3.Connection, page_id: int, number: int, slug: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM revision WHERE page_id = ? AND number = ?", (page_id, number)
+    ).fetchone()
+    if row is None:
+        raise RevisionNotFound(slug, number)
+    return row
+
+
+def _latest_revision(conn: sqlite3.Connection, page: sqlite3.Row) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM revision WHERE id = ?", (page["latest_rev_id"],)).fetchone()
+    if row is None:  # pragma: no cover - only reachable if the DB is corrupt
+        raise PageNotFound(page["slug"])
+    return row
+
+
+def _view(
+    conn: sqlite3.Connection,
+    page: sqlite3.Row,
+    revision: sqlite3.Row,
+    settings: Settings,
+    redirected_from: str | None = None,
+) -> PageView:
+    content = load_text(conn, revision["text_id"])
+    html, links = render_revision(
+        conn,
+        revision["id"],
+        content,
+        settings,
+        cacheable=revision["id"] == page["latest_rev_id"],
+    )
+    return PageView(
+        id=page["id"],
+        slug=page["slug"],
+        title=page["title"],
+        created_at=page["created_at"],
+        updated_at=page["updated_at"],
+        revision=revision,
+        content=content,
+        html=html,
+        links=links,
+        redirected_from=redirected_from,
+    )
+
+
+def get_page(conn: sqlite3.Connection, slug: str, settings: Settings) -> PageView:
+    page, redirected_from = _resolve_slug(conn, slug)
+    return _view(conn, page, _latest_revision(conn, page), settings, redirected_from)
+
+
+def get_revision(
+    conn: sqlite3.Connection, slug: str, number: int, settings: Settings
+) -> PageView:
+    page, redirected_from = _resolve_slug(conn, slug)
+    revision = _revision_row(conn, page["id"], number, page["slug"])
+    return _view(conn, page, revision, settings, redirected_from)
+
+
+def list_pages(conn: sqlite3.Connection, limit: int, offset: int) -> tuple[list[sqlite3.Row], int]:
+    total = conn.execute("SELECT COUNT(*) AS n FROM page").fetchone()["n"]
+    rows = conn.execute(
+        """
+        SELECT p.slug, p.title, p.created_at, p.updated_at,
+               r.number AS revision_number, r.byte_size, r.author
+        FROM page p
+        LEFT JOIN revision r ON r.id = p.latest_rev_id
+        ORDER BY p.updated_at DESC, p.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    ).fetchall()
+    return rows, total
+
+
+def list_revisions(
+    conn: sqlite3.Connection, slug: str, limit: int, offset: int
+) -> tuple[list[sqlite3.Row], int, str]:
+    page, _ = _resolve_slug(conn, slug)
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM revision WHERE page_id = ?", (page["id"],)
+    ).fetchone()["n"]
+    rows = conn.execute(
+        """
+        SELECT id, number, title, comment, author, byte_size, parent_id, created_at
+        FROM revision WHERE page_id = ?
+        ORDER BY number DESC LIMIT ? OFFSET ?
+        """,
+        (page["id"], limit, offset),
+    ).fetchall()
+    return rows, total, page["slug"]
+
+
+def _names_of(conn: sqlite3.Connection, page: sqlite3.Row) -> list[str]:
+    """Every slug that reaches this page: its own, plus all its old names."""
+    aliases = conn.execute(
+        "SELECT from_slug FROM redirect WHERE to_page_id = ?", (page["id"],)
+    ).fetchall()
+    return [page["slug"], *(row["from_slug"] for row in aliases)]
+
+
+def backlinks(conn: sqlite3.Connection, slug: str) -> tuple[list[sqlite3.Row], str]:
+    """Pages linking here, including links written against an old name."""
+    page, _ = _resolve_slug(conn, slug)
+    names = _names_of(conn, page)
+    placeholders = ",".join("?" * len(names))
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT p.slug, p.title, p.updated_at
+        FROM pagelink l JOIN page p ON p.id = l.from_page_id
+        WHERE l.to_slug IN ({placeholders}) ORDER BY p.title
+        """,
+        names,
+    ).fetchall()
+    return rows, page["slug"]
+
+
+# --------------------------------------------------------------------------
+# writes
+# --------------------------------------------------------------------------
+
+
+def _index_page(conn: sqlite3.Connection, page_id: int, slug: str, title: str, body: str) -> None:
+    # FTS5 has no UPSERT, so replace the row outright.
+    conn.execute("DELETE FROM page_fts WHERE rowid = ?", (page_id,))
+    conn.execute(
+        "INSERT INTO page_fts (rowid, slug, title, body) VALUES (?, ?, ?, ?)",
+        (page_id, slug, title, body),
+    )
+
+
+def _record_links(conn: sqlite3.Connection, page_id: int, content: str) -> None:
+    conn.execute("DELETE FROM pagelink WHERE from_page_id = ?", (page_id,))
+    targets = markup.extract_links(content)
+    if targets:
+        conn.executemany(
+            "INSERT INTO pagelink (from_page_id, to_slug) VALUES (?, ?)",
+            [(page_id, target) for target in targets],
+        )
+
+
+def _insert_revision_row(
+    conn: sqlite3.Connection,
+    *,
+    page_id: int,
+    number: int,
+    parent_id: int | None,
+    text_id: int,
+    byte_size: int,
+    title: str,
+    author: str,
+    comment: str,
+    now: str,
+) -> int:
+    """Append a revision pointing at an already-stored body.
+
+    A rename reuses its predecessor's text_id: bodies are immutable, so two
+    revisions sharing one is safe and saves storing the same text twice.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO revision
+            (page_id, number, text_id, title, comment, author, byte_size, parent_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (page_id, number, text_id, title, comment, author, byte_size, parent_id, now),
+    )
+    return int(cursor.lastrowid)
+
+
+def _insert_revision(
+    conn: sqlite3.Connection,
+    *,
+    page_id: int,
+    number: int,
+    parent_id: int | None,
+    title: str,
+    content: str,
+    author: str,
+    comment: str,
+    now: str,
+    settings: Settings,
+) -> int:
+    """Store a new body and append a revision pointing at it."""
+    text_id, byte_size = store_text(conn, content, settings.compress_min_bytes)
+    return _insert_revision_row(
+        conn,
+        page_id=page_id,
+        number=number,
+        parent_id=parent_id,
+        text_id=text_id,
+        byte_size=byte_size,
+        title=title,
+        author=author,
+        comment=comment,
+        now=now,
+    )
+
+
+def _check_size(content: str, settings: Settings) -> None:
+    size = len(content.encode("utf-8"))
+    if size > settings.max_content_bytes:
+        raise ContentTooLarge(size, settings.max_content_bytes)
+
+
+def create_page(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    title: str,
+    content: str,
+    author: str,
+    comment: str,
+    settings: Settings,
+) -> PageView:
+    _check_size(content, settings)
+    now = _now()
+    with write_tx(conn):
+        if conn.execute("SELECT 1 FROM page WHERE slug = ?", (slug,)).fetchone():
+            raise SlugConflict(slug)
+        if conn.execute("SELECT 1 FROM redirect WHERE from_slug = ?", (slug,)).fetchone():
+            # Taking the name silently would break the trail left by a rename.
+            raise RedirectConflict(
+                slug, "it is an old name of another page; remove the redirect first"
+            )
+        page_id = int(
+            conn.execute(
+                "INSERT INTO page (slug, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (slug, title, now, now),
+            ).lastrowid
+        )
+        rev_id = _insert_revision(
+            conn,
+            page_id=page_id,
+            number=1,
+            parent_id=None,
+            title=title,
+            content=content,
+            author=author,
+            comment=comment or "Created page",
+            now=now,
+            settings=settings,
+        )
+        conn.execute("UPDATE page SET latest_rev_id = ? WHERE id = ?", (rev_id, page_id))
+        _index_page(conn, page_id, slug, title, content)
+        _record_links(conn, page_id, content)
+    return get_page(conn, slug, settings)
+
+
+def update_page(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    title: str | None,
+    content: str,
+    author: str,
+    comment: str,
+    base_revision: int | None,
+    settings: Settings,
+) -> tuple[PageView, bool]:
+    """Save a new revision. Returns ``(view, changed)``.
+
+    An edit that changes neither title nor body is a no-op — MediaWiki calls
+    this a null edit — and does not grow the history.
+    """
+    _check_size(content, settings)
+    now = _now()
+    with write_tx(conn):
+        # Editing through an old name edits the page it points at.
+        page, _ = _resolve_slug(conn, slug)
+        slug = page["slug"]
+        latest = _latest_revision(conn, page)
+        if base_revision is not None and base_revision != latest["number"]:
+            raise EditConflict(slug, base_revision, latest["number"])
+
+        new_title = page["title"] if title is None else title
+        if content == load_text(conn, latest["text_id"]) and new_title == page["title"]:
+            changed = False
+        else:
+            rev_id = _insert_revision(
+                conn,
+                page_id=page["id"],
+                number=latest["number"] + 1,
+                parent_id=latest["id"],
+                title=new_title,
+                content=content,
+                author=author,
+                comment=comment,
+                now=now,
+                settings=settings,
+            )
+            conn.execute(
+                "UPDATE page SET title = ?, latest_rev_id = ?, updated_at = ? WHERE id = ?",
+                (new_title, rev_id, now, page["id"]),
+            )
+            _index_page(conn, page["id"], slug, new_title, content)
+            _record_links(conn, page["id"], content)
+            _drop_stale_cache(conn, page["id"], rev_id)
+            changed = True
+    return get_page(conn, slug, settings), changed
+
+
+def revert_page(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    number: int,
+    author: str,
+    comment: str,
+    settings: Settings,
+) -> tuple[PageView, bool]:
+    """Re-save an old revision as a new one. History is never rewritten."""
+    with write_tx(conn):
+        page, _ = _resolve_slug(conn, slug)
+        slug = page["slug"]
+        target = _revision_row(conn, page["id"], number, slug)
+        content = load_text(conn, target["text_id"])
+        title = target["title"]
+    return update_page(
+        conn,
+        slug=slug,
+        title=title,
+        content=content,
+        author=author,
+        comment=comment or f"Reverted to revision {number}",
+        base_revision=None,
+        settings=settings,
+    )
+
+
+def delete_page(conn: sqlite3.Connection, slug: str) -> str:
+    """Delete whatever lives at exactly `slug`. Returns what that was.
+
+    Deliberately does not follow old names: ``DELETE /pages/<old-name>`` drops
+    the alias, never the page it points at. Destroying content through a stale
+    name would be the worse surprise of the two.
+    """
+    with write_tx(conn):
+        alias = conn.execute("SELECT 1 FROM redirect WHERE from_slug = ?", (slug,)).fetchone()
+        if alias is not None:
+            conn.execute("DELETE FROM redirect WHERE from_slug = ?", (slug,))
+            return "redirect"
+
+        page = _page_row(conn, slug)
+        text_ids = [
+            row["text_id"]
+            for row in conn.execute(
+                "SELECT text_id FROM revision WHERE page_id = ?", (page["id"],)
+            )
+        ]
+        # Clear the pointer first so the page -> revision FK cannot trip.
+        conn.execute("UPDATE page SET latest_rev_id = NULL WHERE id = ?", (page["id"],))
+        conn.execute("DELETE FROM page WHERE id = ?", (page["id"],))
+        conn.execute("DELETE FROM page_fts WHERE rowid = ?", (page["id"],))
+        # Old names go with it, via the redirect -> page foreign key cascade.
+        delete_texts(conn, text_ids)
+    return "page"
+
+
+# --------------------------------------------------------------------------
+# rename and redirects
+# --------------------------------------------------------------------------
+
+
+def rename_page(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    new_slug: str | None,
+    new_title: str | None,
+    author: str,
+    comment: str,
+    leave_redirect: bool,
+    settings: Settings,
+) -> tuple[PageView, bool]:
+    """Move a page to a new slug and/or title. Returns ``(view, changed)``.
+
+    The move is recorded as a revision so history shows it, but that revision
+    reuses its predecessor's text_id rather than storing the body again.
+    """
+    now = _now()
+    with write_tx(conn):
+        page, _ = _resolve_slug(conn, slug)
+        old_slug = page["slug"]
+        target_slug = old_slug if new_slug is None else new_slug
+        target_title = page["title"] if new_title is None else new_title
+
+        if target_slug == old_slug and target_title == page["title"]:
+            changed = False
+        else:
+            if target_slug != old_slug:
+                if conn.execute(
+                    "SELECT 1 FROM page WHERE slug = ? AND id <> ?", (target_slug, page["id"])
+                ).fetchone():
+                    raise SlugConflict(target_slug)
+                alias = conn.execute(
+                    "SELECT to_page_id FROM redirect WHERE from_slug = ?", (target_slug,)
+                ).fetchone()
+                if alias is not None and alias["to_page_id"] != page["id"]:
+                    raise RedirectConflict(
+                        target_slug, "it is an old name of a different page"
+                    )
+                # Moving back onto one of this page's own old names: the real
+                # page reclaims the slug and the now-pointless alias goes.
+                conn.execute("DELETE FROM redirect WHERE from_slug = ?", (target_slug,))
+
+            latest = _latest_revision(conn, page)
+            if not comment:
+                comment = (
+                    f"Renamed {old_slug} → {target_slug}"
+                    if target_slug != old_slug
+                    else f"Retitled to {target_title}"
+                )
+            rev_id = _insert_revision_row(
+                conn,
+                page_id=page["id"],
+                number=latest["number"] + 1,
+                parent_id=latest["id"],
+                text_id=latest["text_id"],
+                byte_size=latest["byte_size"],
+                title=target_title,
+                author=author,
+                comment=comment,
+                now=now,
+            )
+            conn.execute(
+                "UPDATE page SET slug = ?, title = ?, latest_rev_id = ?, updated_at = ? "
+                "WHERE id = ?",
+                (target_slug, target_title, rev_id, now, page["id"]),
+            )
+            if target_slug != old_slug and leave_redirect:
+                conn.execute(
+                    """
+                    INSERT INTO redirect (from_slug, to_page_id, created_at, created_by)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (from_slug) DO UPDATE SET
+                        to_page_id = excluded.to_page_id,
+                        created_at = excluded.created_at,
+                        created_by = excluded.created_by
+                    """,
+                    (old_slug, page["id"], now, author),
+                )
+            _index_page(
+                conn,
+                page["id"],
+                target_slug,
+                target_title,
+                load_text(conn, latest["text_id"]),
+            )
+            _drop_stale_cache(conn, page["id"], rev_id)
+            changed = True
+
+    return get_page(conn, target_slug, settings), changed
+
+
+def add_redirect(conn: sqlite3.Connection, *, slug: str, alias: str, author: str) -> str:
+    """Point `alias` at the page reachable from `slug`. Returns the target slug."""
+    now = _now()
+    with write_tx(conn):
+        page, _ = _resolve_slug(conn, slug)
+        if alias == page["slug"]:
+            raise RedirectConflict(alias, "it is the page's own slug")
+        if conn.execute("SELECT 1 FROM page WHERE slug = ?", (alias,)).fetchone():
+            raise SlugConflict(alias)
+        existing = conn.execute(
+            "SELECT to_page_id FROM redirect WHERE from_slug = ?", (alias,)
+        ).fetchone()
+        if existing is not None and existing["to_page_id"] != page["id"]:
+            raise RedirectConflict(alias, "it is already an old name of a different page")
+        conn.execute(
+            """
+            INSERT INTO redirect (from_slug, to_page_id, created_at, created_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (from_slug) DO NOTHING
+            """,
+            (alias, page["id"], now, author),
+        )
+        return page["slug"]
+
+
+def remove_redirect(conn: sqlite3.Connection, alias: str) -> None:
+    with write_tx(conn):
+        if not conn.execute("SELECT 1 FROM redirect WHERE from_slug = ?", (alias,)).fetchone():
+            raise RedirectNotFound(alias)
+        conn.execute("DELETE FROM redirect WHERE from_slug = ?", (alias,))
+
+
+def list_redirects(
+    conn: sqlite3.Connection, limit: int, offset: int
+) -> tuple[list[sqlite3.Row], int]:
+    total = conn.execute("SELECT COUNT(*) AS n FROM redirect").fetchone()["n"]
+    rows = conn.execute(
+        """
+        SELECT r.from_slug, p.slug AS to_slug, r.created_at, r.created_by
+        FROM redirect r JOIN page p ON p.id = r.to_page_id
+        ORDER BY r.created_at DESC, r.from_slug
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    ).fetchall()
+    return rows, total
+
+
+def redirects_to(conn: sqlite3.Connection, slug: str) -> tuple[list[sqlite3.Row], str]:
+    """Every old name of the page reachable from `slug`."""
+    page, _ = _resolve_slug(conn, slug)
+    rows = conn.execute(
+        """
+        SELECT from_slug, ? AS to_slug, created_at, created_by
+        FROM redirect WHERE to_page_id = ? ORDER BY created_at DESC, from_slug
+        """,
+        (page["slug"], page["id"]),
+    ).fetchall()
+    return rows, page["slug"]
+
+
+# --------------------------------------------------------------------------
+# compaction
+# --------------------------------------------------------------------------
+
+
+def _page_text_ids(conn: sqlite3.Connection, page_id: int) -> list[int]:
+    """Distinct body rows of one page, oldest revision first.
+
+    Distinct because a rename points its revision at the previous body rather
+    than storing it again.
+    """
+    seen: list[int] = []
+    for row in conn.execute(
+        "SELECT text_id FROM revision WHERE page_id = ? ORDER BY number", (page_id,)
+    ):
+        if row["text_id"] not in seen:
+            seen.append(row["text_id"])
+    return seen
+
+
+def _deltify(conn: sqlite3.Connection, text_ids: list[int]) -> int:
+    """Re-encode older bodies as deltas against their window's keyframe."""
+    converted = 0
+    for position, text_id in enumerate(text_ids):
+        is_keyframe = position % KEYFRAME_INTERVAL == 0
+        is_newest = position == len(text_ids) - 1
+        if is_keyframe or is_newest or is_delta(conn, text_id) or is_packed(conn, text_id):
+            continue
+
+        base_id = text_ids[(position // KEYFRAME_INTERVAL) * KEYFRAME_INTERVAL]
+        body = load_text(conn, text_id)
+        payload = make_delta(load_text(conn, base_id), body)
+        if encoded_delta_size(payload) >= stored_size(conn, text_id):
+            # Rewriting would cost more than it saves; leave it whole.
+            continue
+
+        replace_with_delta(conn, text_id, base_id, payload)
+        if load_text(conn, text_id) != body:  # pragma: no cover - guards a codec bug
+            raise DeltaError(f"delta for text row {text_id} did not round-trip")
+        converted += 1
+    return converted
+
+
+def _bundle(conn: sqlite3.Connection, text_ids: list[int], now: str) -> int:
+    """Pack each window's payloads into one shared gzip stream.
+
+    A window holds a keyframe and the deltas taken against it, so compressing
+    them together lets gzip carry its dictionary across the whole group instead
+    of restarting — and pays one gzip header instead of sixteen.
+
+    The newest body is left out so reading the current page never unpacks a
+    bundle.
+    """
+    packable = text_ids[:-1]
+    bundled = 0
+    for start in range(0, len(packable), KEYFRAME_INTERVAL):
+        window = packable[start : start + KEYFRAME_INTERVAL]
+        if len(window) < 2:
+            continue
+        expected = {text_id: load_text(conn, text_id) for text_id in window}
+        if pack_into_blob(conn, window, now) <= 0:
+            continue
+        for text_id, body in expected.items():
+            if load_text(conn, text_id) != body:  # pragma: no cover - guards a packing bug
+                raise DeltaError(f"text row {text_id} did not survive bundling")
+        bundled += 1
+    return bundled
+
+
+def compact_page(conn: sqlite3.Connection, page_id: int) -> dict[str, int]:
+    """Shrink a page's stored history.
+
+    Two independent passes. Deltas remove the redundancy *between* revisions;
+    bundling removes the overhead of compressing each one separately. Either
+    helps on its own, and MediaWiki's concatenated blobs show the second is
+    worth doing even with no deltas at all.
+    """
+    text_ids = _page_text_ids(conn, page_id)
+    now = _now()
+    with write_tx(conn):
+        converted = _deltify(conn, text_ids)
+        bundled = _bundle(conn, text_ids, now)
+    return {"converted": converted, "bundled": bundled}
+
+
+def compact_all(conn: sqlite3.Connection) -> dict[str, int]:
+    """Run compaction across every page."""
+    page_ids = [row["id"] for row in conn.execute("SELECT id FROM page ORDER BY id")]
+    before = storage_bytes(conn)
+    totals = {"pages": len(page_ids), "converted": 0, "bundled": 0}
+    for page_id in page_ids:
+        result = compact_page(conn, page_id)
+        for key in ("converted", "bundled"):
+            totals[key] += result[key]
+    totals["before"] = before
+    totals["after"] = storage_bytes(conn)
+    totals["reclaimed"] = totals["before"] - totals["after"]
+    return totals
+
+
+# --------------------------------------------------------------------------
+# diff
+# --------------------------------------------------------------------------
+
+
+def diff_revisions(
+    conn: sqlite3.Connection, slug: str, from_number: int, to_number: int
+) -> dict[str, object]:
+    page, _ = _resolve_slug(conn, slug)
+    slug = page["slug"]
+    left = _revision_row(conn, page["id"], from_number, slug)
+    right = _revision_row(conn, page["id"], to_number, slug)
+
+    left_lines = load_text(conn, left["text_id"]).splitlines(keepends=True)
+    right_lines = load_text(conn, right["text_id"]).splitlines(keepends=True)
+    lines = list(
+        difflib.unified_diff(
+            left_lines,
+            right_lines,
+            fromfile=f"{slug}@{from_number}",
+            tofile=f"{slug}@{to_number}",
+            lineterm="\n",
+        )
+    )
+    added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
+    return {
+        "slug": slug,
+        "from_revision": from_number,
+        "to_revision": to_number,
+        "diff": "".join(lines),
+        "added_lines": added,
+        "removed_lines": removed,
+        "byte_delta": right["byte_size"] - left["byte_size"],
+    }
+
+
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
+
+
+def _excerpt(body: str, needle: str, width: int = 160) -> str:
+    """Plain-text excerpt with the match highlighted, for the LIKE fallback."""
+    position = body.lower().find(needle.lower())
+    if position == -1:
+        return body[:width]
+    start = max(0, position - width // 3)
+    chunk = body[start : start + width]
+    local = chunk.lower().find(needle.lower())
+    if local == -1:
+        return chunk
+    highlighted = (
+        chunk[:local] + _HL_OPEN + chunk[local : local + len(needle)] + _HL_CLOSE
+        + chunk[local + len(needle) :]
+    )
+    return ("…" if start else "") + highlighted + ("…" if start + width < len(body) else "")
+
+
+def _like_search(
+    conn: sqlite3.Connection, query: str, limit: int, offset: int
+) -> list[dict[str, object]]:
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    rows = conn.execute(
+        r"""
+        SELECT p.slug, p.title, p.updated_at, f.body
+        FROM page_fts f JOIN page p ON p.id = f.rowid
+        WHERE f.title LIKE ? ESCAPE '\' OR f.body LIKE ? ESCAPE '\'
+        ORDER BY p.updated_at DESC LIMIT ? OFFSET ?
+        """,
+        (pattern, pattern, limit, offset),
+    ).fetchall()
+    return [
+        {
+            "slug": row["slug"],
+            "title": row["title"],
+            "updated_at": row["updated_at"],
+            "snippet": _excerpt(row["body"], query),
+            "score": None,
+        }
+        for row in rows
+    ]
+
+
+def search(
+    conn: sqlite3.Connection, query: str, limit: int, offset: int
+) -> list[dict[str, object]]:
+    """Full-text search.
+
+    Tries FTS5 first, falling back to a LIKE scan for queries too short for the
+    trigram index or that the index simply misses.
+    """
+    query = query.strip()
+    if not query:
+        return []
+
+    hits: list[dict[str, object]] = []
+    if len(query) >= 3:
+        # Quote the whole query so FTS5 operators in user input stay literal.
+        match = '"' + query.replace('"', '""') + '"'
+        try:
+            rows = conn.execute(
+                """
+                SELECT p.slug, p.title, p.updated_at,
+                       snippet(page_fts, 2, ?, ?, '…', 16) AS snippet,
+                       bm25(page_fts, 0.0, 5.0, 1.0) AS score
+                FROM page_fts JOIN page p ON p.id = page_fts.rowid
+                WHERE page_fts MATCH ?
+                ORDER BY score LIMIT ? OFFSET ?
+                """,
+                (_HL_OPEN, _HL_CLOSE, match, limit, offset),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        hits = [dict(row) for row in rows]
+
+    # Only fall back on the first page, so paging past the end of a real FTS
+    # result set does not suddenly start showing LIKE matches.
+    if hits or offset:
+        return hits
+    return _like_search(conn, query, limit, offset)
+
+
+def highlight_to_html(snippet: str) -> str:
+    """Escape a snippet, then turn the internal markers into <mark> tags."""
+    return html.escape(snippet).replace(_HL_OPEN, "<mark>").replace(_HL_CLOSE, "</mark>")

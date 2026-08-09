@@ -1,0 +1,104 @@
+# OmniLog wiki API
+
+GET http://127.0.0.1:8000/api/health
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/pages
+Content-Type: application/json
+
+{
+  "title": "위키 시스템",
+  "content": "OmniLog 설계 문서.\n\n관련 문서: [[FastAPI Guide]]\n",
+  "author": "jin"
+}
+
+###
+
+GET http://127.0.0.1:8000/api/pages
+Accept: application/json
+
+###
+
+GET http://127.0.0.1:8000/api/pages/위키-시스템
+Accept: application/json
+
+###
+
+PUT http://127.0.0.1:8000/api/pages/위키-시스템
+Content-Type: application/json
+
+{
+  "content": "OmniLog 설계 문서.\n\n본문을 보강했습니다.\n",
+  "comment": "본문 보강",
+  "author": "hana",
+  "base_revision": 1
+}
+
+###
+
+GET http://127.0.0.1:8000/api/pages/위키-시스템/revisions
+Accept: application/json
+
+###
+
+GET http://127.0.0.1:8000/api/pages/위키-시스템/diff?from=1&to=2
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/pages/위키-시스템/revisions/1/revert
+Content-Type: application/json
+
+{ "author": "jin", "comment": "되돌림" }
+
+###
+
+GET http://127.0.0.1:8000/api/pages/fastapi-guide/backlinks
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/pages/위키-시스템/rename
+Content-Type: application/json
+
+{
+  "slug": "OmniLog 위키",
+  "title": "OmniLog 위키",
+  "author": "jin"
+}
+
+###
+# The old slug still resolves, with redirected_from set.
+
+GET http://127.0.0.1:8000/api/pages/위키-시스템
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/pages/omnilog-위키/redirects
+Content-Type: application/json
+
+{ "slug": "위키 엔진" }
+
+###
+
+GET http://127.0.0.1:8000/api/redirects
+Accept: application/json
+
+###
+
+DELETE http://127.0.0.1:8000/api/redirects/위키-엔진
+
+###
+
+GET http://127.0.0.1:8000/api/search?q=설계
+Accept: application/json
+
+###
+
+# Deletes the page and, with it, every old name pointing at it.
+DELETE http://127.0.0.1:8000/api/pages/omnilog-위키
+
+###
