@@ -1,3 +1,11 @@
 .idea/
 __pycache__/
 *.pyc
+
+# SQLite 데이터베이스와 WAL 부산물
+*.db
+*.db-wal
+*.db-shm
+
+# 실습 스크립트가 만드는 DB
+scripts/_out/
