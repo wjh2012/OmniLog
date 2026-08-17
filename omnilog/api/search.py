@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from .. import repository
-from ..deps import Conn
+from ..auth import VIEWER
+from ..deps import Conn, require_role
 from ..schemas import SearchHit, SearchResult
 
 router = APIRouter()
 
 
-@router.get("/search", response_model=SearchResult, summary="Search pages")
+@router.get(
+    "/search",
+    response_model=SearchResult,
+    summary="Search pages",
+    operation_id="search_pages",
+    dependencies=[Depends(require_role(VIEWER))],
+)
 def search(
     conn: Conn,
     q: str = Query(min_length=1, max_length=200, description="Search text"),

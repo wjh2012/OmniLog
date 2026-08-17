@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Path, Query, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from .. import repository
-from ..deps import Config, Conn
+from ..auth import EDITOR, VIEWER
+from ..deps import Config, Conn, require_role
 from ..errors import PageNotFound
 from ..repository import PageView
 from ..schemas import (
@@ -34,6 +35,11 @@ from ..slug import slugify
 router = APIRouter()
 
 SlugPath = Path(min_length=1, max_length=300, description="Page slug")
+
+# Tags double as the MCP scope gate: see omnilog.mcp.restrict_tag wiring.
+EDITOR_TAG = "role-editor"
+_editor = [Depends(require_role(EDITOR))]
+_viewer = [Depends(require_role(VIEWER))]
 
 
 def _normalise(raw_slug: str) -> str:
@@ -79,6 +85,9 @@ def _detail(view: PageView) -> dict:
     response_model=PageDetail,
     status_code=status.HTTP_201_CREATED,
     summary="Create a page",
+    operation_id="create_page",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def create_page(payload: PageCreate, conn: Conn, settings: Config) -> dict:
     title = payload.title.strip()
@@ -94,7 +103,13 @@ def create_page(payload: PageCreate, conn: Conn, settings: Config) -> dict:
     return _detail(view)
 
 
-@router.get("/pages", response_model=PageList, summary="List pages")
+@router.get(
+    "/pages",
+    response_model=PageList,
+    summary="List pages",
+    operation_id="list_pages",
+    dependencies=_viewer,
+)
 def list_pages(
     conn: Conn,
     limit: int = Query(default=50, ge=1, le=200),
@@ -109,12 +124,25 @@ def list_pages(
     }
 
 
-@router.get("/pages/{slug}", response_model=PageDetail, summary="Read a page")
+@router.get(
+    "/pages/{slug}",
+    response_model=PageDetail,
+    summary="Read a page",
+    operation_id="read_page",
+    dependencies=_viewer,
+)
 def read_page(conn: Conn, settings: Config, slug: str = SlugPath) -> dict:
     return _detail(repository.get_page(conn, _normalise(slug), settings))
 
 
-@router.put("/pages/{slug}", response_model=PageSaved, summary="Save a new revision")
+@router.put(
+    "/pages/{slug}",
+    response_model=PageSaved,
+    summary="Save a new revision",
+    operation_id="update_page",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
+)
 def update_page(payload: PageUpdate, conn: Conn, settings: Config, slug: str = SlugPath) -> dict:
     view, changed = repository.update_page(
         conn,
@@ -137,6 +165,9 @@ def update_page(payload: PageUpdate, conn: Conn, settings: Config, slug: str = S
         "Does not follow old names. If the slug is an alias left behind by a "
         "rename, only that alias is removed; the page it points at survives."
     ),
+    operation_id="delete_page",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def delete_page(conn: Conn, slug: str = SlugPath) -> Response:
     deleted = repository.delete_page(conn, _normalise(slug))
@@ -149,6 +180,9 @@ def delete_page(conn: Conn, slug: str = SlugPath) -> Response:
     "/pages/{slug}/rename",
     response_model=PageSaved,
     summary="Move a page to a new slug and/or title",
+    operation_id="rename_page",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def rename_page(
     payload: RenameRequest, conn: Conn, settings: Config, slug: str = SlugPath
@@ -170,6 +204,8 @@ def rename_page(
     "/pages/{slug}/redirects",
     response_model=PageRedirects,
     summary="Old names pointing at this page",
+    operation_id="list_page_redirects",
+    dependencies=_viewer,
 )
 def page_redirects(conn: Conn, slug: str = SlugPath) -> dict:
     rows, resolved = repository.redirects_to(conn, _normalise(slug))
@@ -181,6 +217,9 @@ def page_redirects(conn: Conn, slug: str = SlugPath) -> dict:
     response_model=PageRedirects,
     status_code=status.HTTP_201_CREATED,
     summary="Point another slug at this page",
+    operation_id="add_page_redirect",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def add_page_redirect(payload: RedirectCreate, conn: Conn, slug: str = SlugPath) -> dict:
     resolved = repository.add_redirect(
@@ -194,7 +233,11 @@ def add_page_redirect(payload: RedirectCreate, conn: Conn, slug: str = SlugPath)
 
 
 @router.get(
-    "/pages/{slug}/revisions", response_model=RevisionList, summary="List revisions"
+    "/pages/{slug}/revisions",
+    response_model=RevisionList,
+    summary="List revisions",
+    operation_id="list_revisions",
+    dependencies=_viewer,
 )
 def list_revisions(
     conn: Conn,
@@ -216,6 +259,8 @@ def list_revisions(
     "/pages/{slug}/revisions/{number}",
     response_model=PageDetail,
     summary="Read one revision",
+    operation_id="read_revision",
+    dependencies=_viewer,
 )
 def read_revision(
     conn: Conn,
@@ -227,7 +272,11 @@ def read_revision(
 
 
 @router.get(
-    "/pages/{slug}/diff", response_model=DiffResult, summary="Diff two revisions"
+    "/pages/{slug}/diff",
+    response_model=DiffResult,
+    summary="Diff two revisions",
+    operation_id="diff_page",
+    dependencies=_viewer,
 )
 def diff_page(
     conn: Conn,
@@ -242,6 +291,9 @@ def diff_page(
     "/pages/{slug}/revisions/{number}/revert",
     response_model=PageSaved,
     summary="Restore an old revision as a new one",
+    operation_id="revert_page",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def revert_page(
     conn: Conn,
@@ -266,6 +318,8 @@ def revert_page(
     "/pages/{slug}/backlinks",
     response_model=BacklinkList,
     summary="Pages linking here",
+    operation_id="page_backlinks",
+    dependencies=_viewer,
 )
 def page_backlinks(conn: Conn, slug: str = SlugPath) -> dict:
     rows, resolved = repository.backlinks(conn, _normalise(slug))

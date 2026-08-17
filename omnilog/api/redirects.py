@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Path, Query, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 
 from .. import repository
-from ..deps import Conn
+from ..auth import EDITOR, VIEWER
+from ..deps import Conn, require_role
 from ..errors import PageNotFound
 from ..schemas import RedirectList, RedirectRef
 from ..slug import slugify
@@ -14,8 +15,16 @@ router = APIRouter()
 
 AliasPath = Path(min_length=1, max_length=300, description="The old slug")
 
+EDITOR_TAG = "role-editor"
 
-@router.get("/redirects", response_model=RedirectList, summary="List every old name")
+
+@router.get(
+    "/redirects",
+    response_model=RedirectList,
+    summary="List every old name",
+    operation_id="list_redirects",
+    dependencies=[Depends(require_role(VIEWER))],
+)
 def list_redirects(
     conn: Conn,
     limit: int = Query(default=50, ge=1, le=200),
@@ -34,6 +43,9 @@ def list_redirects(
     "/redirects/{slug}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Drop an old name",
+    operation_id="delete_redirect",
+    tags=[EDITOR_TAG],
+    dependencies=[Depends(require_role(EDITOR))],
 )
 def delete_redirect(conn: Conn, slug: str = AliasPath) -> Response:
     normalised = slugify(slug, strict=False)
