@@ -38,6 +38,45 @@ CREATE TABLE IF NOT EXISTS blob (
     created_at TEXT NOT NULL
 );
 
+-- Bytes of an uploaded source file. Keyed by content hash, so the same file
+-- attached to two sources is stored once.
+CREATE TABLE IF NOT EXISTS file (
+    id         INTEGER PRIMARY KEY,
+    sha256     TEXT NOT NULL UNIQUE,
+    media_type TEXT NOT NULL,
+    filename   TEXT NOT NULL,
+    byte_size  INTEGER NOT NULL,
+    data       BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Sources managed apart from any page: a link, a passage of text, or a file.
+-- `id` is the identity and `key` the address, the same split page makes. Pages
+-- cite a key, so editing a source's title fixes it everywhere at once.
+--
+-- Deliberately not versioned. A page is a work whose history matters; a source
+-- is a record of what something points at, and only the current answer is
+-- interesting. Quoted passages still land in the immutable text store.
+CREATE TABLE IF NOT EXISTS source (
+    id         INTEGER PRIMARY KEY,
+    key        TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL,            -- 'link' | 'text' | 'file'
+    title      TEXT NOT NULL DEFAULT '',
+    url        TEXT NOT NULL DEFAULT '',
+    host       TEXT NOT NULL DEFAULT '', -- denormalised from url, for per-domain lookups
+    text_id    INTEGER REFERENCES text(id) ON DELETE SET NULL,  -- kind='text'
+    file_id    INTEGER REFERENCES file(id) ON DELETE SET NULL,  -- kind='file'
+    author     TEXT NOT NULL DEFAULT '',
+    published  TEXT NOT NULL DEFAULT '',  -- free-form; sources date themselves however they like
+    locator    TEXT NOT NULL DEFAULT '',  -- page number, chapter, timestamp
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_kind ON source (kind);
+CREATE INDEX IF NOT EXISTS idx_source_host ON source (host);
+
 CREATE TABLE IF NOT EXISTS page (
     id            INTEGER PRIMARY KEY,
     slug          TEXT NOT NULL UNIQUE,
@@ -74,6 +113,31 @@ CREATE TABLE IF NOT EXISTS pagelink (
 
 CREATE INDEX IF NOT EXISTS idx_pagelink_to ON pagelink (to_slug);
 
+-- Sources cited by each page's current revision: the outward-facing twin of
+-- pagelink. Same lifetime, replaced wholesale on every edit. Only definitions
+-- the body actually refers to get a row.
+--
+-- A row is one of two things. `[^name]: <url>` defines a source inline and
+-- fills url/title/host. `[^@key]` points at the registry and fills source_key
+-- alone -- storing a copy of the source's fields here would go stale the
+-- moment someone corrected the source. Like pagelink.to_slug, the key may name
+-- a source that does not exist, which is how a dangling citation is found.
+CREATE TABLE IF NOT EXISTS citation (
+    from_page_id INTEGER NOT NULL REFERENCES page(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,      -- the [^name] as written, unique within a page
+    ordinal      INTEGER NOT NULL,   -- 1-based, by first reference in the body
+    source_key   TEXT NOT NULL DEFAULT '',  -- '' for an inline definition
+    url          TEXT NOT NULL DEFAULT '',
+    title        TEXT NOT NULL DEFAULT '',
+    host         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (from_page_id, name)
+) WITHOUT ROWID;
+
+-- Reverse index: which pages cite this source, URL, or host.
+CREATE INDEX IF NOT EXISTS idx_citation_source ON citation (source_key);
+CREATE INDEX IF NOT EXISTS idx_citation_url ON citation (url);
+CREATE INDEX IF NOT EXISTS idx_citation_host ON citation (host);
+
 -- Slugs a page used to live at. Targets are page ids, not slugs, so renaming
 -- A -> B -> C leaves every old name pointing straight at the page: redirect
 -- chains and loops cannot form. A from_slug must never also be a page.slug;
@@ -90,6 +154,9 @@ CREATE INDEX IF NOT EXISTS idx_redirect_target ON redirect (to_page_id);
 -- Rendered HTML, gzipped. Safe to key on rev_id alone because bodies are
 -- immutable; link_state additionally tracks how link targets resolved at
 -- render time, so red links turning blue still invalidates the entry.
+-- cite_state does the same for registered sources, which live outside the body
+-- and can be corrected or deleted under a page's feet. Inline definitions need
+-- neither: they resolve out of the body alone.
 --
 -- Only a page's current revision is kept. Caching every revision ever viewed
 -- made this table grow without bound and dominate the database file.
@@ -98,6 +165,8 @@ CREATE TABLE IF NOT EXISTS render_cache (
     html_gz    BLOB NOT NULL,
     links_json TEXT NOT NULL,
     link_state TEXT NOT NULL,
+    cites_json TEXT NOT NULL,   -- citations of this revision, as rendered
+    cite_state TEXT NOT NULL,   -- fingerprint of the registered sources they resolved to
     created_at TEXT NOT NULL
 );
 """
@@ -171,10 +240,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE text ADD COLUMN blob_offset INTEGER")
         conn.execute("ALTER TABLE text ADD COLUMN blob_length INTEGER")
 
+    # citation rows are rebuilt from the body on the next edit, so an added
+    # column only has to be valid for the rows already there -- and '' is
+    # exactly what an inline definition should have.
+    citation_columns = _columns(conn, "citation")
+    if citation_columns and "source_key" not in citation_columns:
+        conn.execute("ALTER TABLE citation ADD COLUMN source_key TEXT NOT NULL DEFAULT ''")
+
     # render_cache holds nothing that cannot be recomputed, so a shape change is
     # a drop rather than a data migration.
     cache_columns = _columns(conn, "render_cache")
-    if cache_columns and "html_gz" not in cache_columns:
+    if cache_columns and not {"html_gz", "cites_json", "cite_state"} <= cache_columns:
         conn.execute("DROP TABLE render_cache")
 
 

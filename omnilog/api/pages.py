@@ -13,8 +13,10 @@ from ..repository import PageView
 from ..schemas import (
     BacklinkList,
     BacklinkRef,
+    CitationRef,
     DiffResult,
     LinkRef,
+    PageCitations,
     PageCreate,
     PageDetail,
     PageList,
@@ -70,6 +72,7 @@ def _detail(view: PageView) -> dict:
             LinkRef(slug=link.slug, exists=link.exists, via_redirect=link.via_redirect)
             for link in view.links
         ],
+        "citations": [CitationRef(**cite._asdict()) for cite in view.citations],
         "redirected_from": view.redirected_from,
     }
 
@@ -270,3 +273,17 @@ def revert_page(
 def page_backlinks(conn: Conn, slug: str = SlugPath) -> dict:
     rows, resolved = repository.backlinks(conn, _normalise(slug))
     return {"slug": resolved, "items": [BacklinkRef(**dict(row)) for row in rows]}
+
+
+@router.get(
+    "/pages/{slug}/citations",
+    response_model=PageCitations,
+    summary="External sources this page cites",
+    description=(
+        "Read from the citation index rather than the body, so it costs no "
+        "render. Only sources the body actually refers to are listed."
+    ),
+)
+def page_citations(conn: Conn, slug: str = SlugPath) -> dict:
+    rows, resolved = repository.citations_of(conn, _normalise(slug))
+    return {"slug": resolved, "items": [CitationRef(**dict(row)) for row in rows]}

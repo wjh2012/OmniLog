@@ -19,14 +19,19 @@ from .db import write_tx
 from .errors import (
     ContentTooLarge,
     EditConflict,
+    FileNotAttached,
+    FileTooLarge,
+    InvalidSource,
     PageNotFound,
     RedirectConflict,
     RedirectNotFound,
     RevisionNotFound,
     SlugConflict,
+    SourceConflict,
+    SourceNotFound,
 )
 from .delta import DeltaError, make_delta
-from .markup import STATUS_PAGE, STATUS_REDIRECT
+from .markup import STATUS_PAGE, STATUS_REDIRECT, Citation
 from .textstore import (
     delete_texts,
     encoded_delta_size,
@@ -69,6 +74,8 @@ class PageView:
     content: str
     html: str
     links: tuple[LinkInfo, ...]
+    #: External sources this revision cites, numbered.
+    citations: tuple[Citation, ...] = ()
     #: Set when the caller asked for one of the page's old names.
     redirected_from: str | None = None
 
@@ -78,14 +85,28 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _fingerprint(mapping: dict[str, str]) -> str:
+    payload = json.dumps(sorted(mapping.items()), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _link_state(status: dict[str, str]) -> str:
     """Fingerprint of how a body's links resolved.
 
     Covers redirect-ness as well as existence, so pointing an old name
     somewhere else invalidates the cached HTML too.
     """
-    payload = json.dumps(sorted(status.items()), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return _fingerprint(status)
+
+
+def _cite_state(sources: dict[str, str]) -> str:
+    """Fingerprint of the registered sources a body cited.
+
+    The same idea as `_link_state`, for the other thing a body points at from
+    outside itself. A source that gets retitled, repointed, deleted or finally
+    registered all show up here as a changed value.
+    """
+    return _fingerprint(sources)
 
 
 def _chunks(values: Sequence[str]):
@@ -116,6 +137,49 @@ def resolve_links(conn: sqlite3.Connection, slugs: Sequence[str]) -> dict[str, s
     return status
 
 
+def resolve_sources(
+    conn: sqlite3.Connection, keys: Sequence[str]
+) -> dict[str, markup.SourceRef]:
+    """Look up registered sources by key, for rendering ``[^@key]``.
+
+    Keys with no source are simply absent, the way a missing page is absent
+    from `resolve_links`.
+    """
+    unique = list(dict.fromkeys(keys))
+    found: dict[str, markup.SourceRef] = {}
+    for chunk, placeholders in _chunks(unique):
+        rows = conn.execute(
+            f"SELECT key, kind, title, url, host, author, published, locator, updated_at "
+            f"FROM source WHERE key IN ({placeholders})",
+            chunk,
+        )
+        for row in rows:
+            found[row["key"]] = markup.SourceRef(
+                key=row["key"],
+                kind=row["kind"],
+                title=row["title"],
+                url=row["url"],
+                host=row["host"],
+                author=row["author"],
+                published=row["published"],
+                locator=row["locator"],
+                # Everything the render depends on, so an edit inside the same
+                # millisecond still counts as a change.
+                fingerprint="|".join(
+                    (
+                        row["updated_at"],
+                        row["kind"],
+                        row["title"],
+                        row["url"],
+                        row["author"],
+                        row["published"],
+                        row["locator"],
+                    )
+                ),
+            )
+    return found
+
+
 # --------------------------------------------------------------------------
 # rendering
 # --------------------------------------------------------------------------
@@ -134,41 +198,59 @@ def render_revision(
     settings: Settings,
     *,
     cacheable: bool = True,
-) -> tuple[str, tuple[LinkInfo, ...]]:
+) -> tuple[str, tuple[LinkInfo, ...], tuple[Citation, ...]]:
     """Render a revision, going through render_cache.
 
     A cache hit is still checked against how the links resolve right now: the
     body is immutable but a red link turns blue the moment its target is
     created, and a live link becomes a redirect the moment its target is
-    renamed.
+    renamed. Registered sources get the same check, for the same reason —
+    someone can correct or delete one without touching this page.
 
     `cacheable` is false for historical revisions. Storing those made the cache
     grow with the number of revisions ever *viewed*, which is unbounded; only a
     page's current revision earns a row.
     """
     cached = conn.execute(
-        "SELECT html_gz, links_json, link_state FROM render_cache WHERE rev_id = ?", (rev_id,)
+        "SELECT html_gz, links_json, link_state, cites_json, cite_state "
+        "FROM render_cache WHERE rev_id = ?",
+        (rev_id,),
     ).fetchone()
     if cached is not None:
         slugs: list[str] = json.loads(cached["links_json"])
+        citations = tuple(Citation(**row) for row in json.loads(cached["cites_json"]))
+        keys = [cite.source_key for cite in citations if cite.source_key]
         status = resolve_links(conn, slugs)
-        if _link_state(status) == cached["link_state"]:
+        sources = resolve_sources(conn, keys) if keys else {}
+        state = {key: sources[key].fingerprint if key in sources else "" for key in keys}
+        if (
+            _link_state(status) == cached["link_state"]
+            and _cite_state(state) == cached["cite_state"]
+        ):
             html = gzip.decompress(cached["html_gz"]).decode("utf-8")
-            return html, _link_infos(slugs, status)
+            return html, _link_infos(slugs, status), citations
 
     rendered = markup.render(
-        content, lambda targets: resolve_links(conn, targets), settings.link_base
+        content,
+        lambda targets: resolve_links(conn, targets),
+        settings.link_base,
+        resolve_sources=lambda keys: resolve_sources(conn, keys),
+        source_base=settings.source_base,
     )
     if cacheable:
         try:
             conn.execute(
                 """
-                INSERT INTO render_cache (rev_id, html_gz, links_json, link_state, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO render_cache
+                    (rev_id, html_gz, links_json, link_state, cites_json, cite_state,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (rev_id) DO UPDATE SET
                     html_gz = excluded.html_gz,
                     links_json = excluded.links_json,
                     link_state = excluded.link_state,
+                    cites_json = excluded.cites_json,
+                    cite_state = excluded.cite_state,
                     created_at = excluded.created_at
                 """,
                 (
@@ -176,13 +258,21 @@ def render_revision(
                     gzip.compress(rendered.html.encode("utf-8"), 6, mtime=0),
                     json.dumps(list(rendered.slugs), ensure_ascii=False),
                     _link_state(dict(rendered.status)),
+                    json.dumps(
+                        [cite._asdict() for cite in rendered.citations], ensure_ascii=False
+                    ),
+                    _cite_state(dict(rendered.sources)),
                     _now(),
                 ),
             )
         except sqlite3.OperationalError:
             # Cache writes are best effort; a locked database must not fail a read.
             pass
-    return rendered.html, _link_infos(rendered.slugs, dict(rendered.status))
+    return (
+        rendered.html,
+        _link_infos(rendered.slugs, dict(rendered.status)),
+        rendered.citations,
+    )
 
 
 def _drop_stale_cache(conn: sqlite3.Connection, page_id: int, keep_rev_id: int) -> None:
@@ -252,7 +342,7 @@ def _view(
     redirected_from: str | None = None,
 ) -> PageView:
     content = load_text(conn, revision["text_id"])
-    html, links = render_revision(
+    html, links, citations = render_revision(
         conn,
         revision["id"],
         content,
@@ -269,6 +359,7 @@ def _view(
         content=content,
         html=html,
         links=links,
+        citations=citations,
         redirected_from=redirected_from,
     )
 
@@ -345,6 +436,536 @@ def backlinks(conn: sqlite3.Connection, slug: str) -> tuple[list[sqlite3.Row], s
 
 
 # --------------------------------------------------------------------------
+# citations
+# --------------------------------------------------------------------------
+
+
+# A citation row carries either a registry key or an inline definition, so
+# every read resolves it the same way: prefer the registered source, fall back
+# to what the body said. Repeated rather than hidden in a view, because SQLite
+# views cannot be parameterised and this has to sit in several queries.
+_RESOLVED_CITATION = """
+    CASE WHEN c.source_key = '' THEN 'inline' ELSE COALESCE(s.kind, 'missing') END AS kind,
+    COALESCE(NULLIF(s.title, ''), c.title) AS title,
+    COALESCE(NULLIF(s.url, ''), c.url) AS url,
+    COALESCE(NULLIF(s.host, ''), c.host) AS host,
+    -- Bibliographic detail exists only in the registry; an inline definition
+    -- has nowhere to write it.
+    COALESCE(s.author, '') AS author,
+    COALESCE(s.published, '') AS published,
+    COALESCE(s.locator, '') AS locator
+"""
+
+#: What counts as one source when citations are grouped: the registry entry if
+#: there is one, the URL otherwise.
+_CITATION_IDENTITY = (
+    "CASE WHEN c.source_key = '' THEN 'url:' || c.url ELSE 'source:' || c.source_key END"
+)
+
+
+def citations_of(conn: sqlite3.Connection, slug: str) -> tuple[list[sqlite3.Row], str]:
+    """Sources cited by the page reachable from `slug`, in reference order.
+
+    Answered from the index, so listing them costs no body read and no render.
+    """
+    page, _ = _resolve_slug(conn, slug)
+    rows = conn.execute(
+        f"""
+        SELECT c.ordinal, c.name, c.source_key, {_RESOLVED_CITATION}
+        FROM citation c LEFT JOIN source s ON s.key = c.source_key
+        WHERE c.from_page_id = ? ORDER BY c.ordinal
+        """,
+        (page["id"],),
+    ).fetchall()
+    return rows, page["slug"]
+
+
+def _citing_pages(
+    conn: sqlite3.Connection, identities: Sequence[str]
+) -> dict[str, list[sqlite3.Row]]:
+    """For each source, the pages citing it. One query instead of one per source."""
+    grouped: dict[str, list[sqlite3.Row]] = {identity: [] for identity in identities}
+    for chunk, placeholders in _chunks(identities):
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT {_CITATION_IDENTITY} AS identity, p.slug, p.title
+            FROM citation c JOIN page p ON p.id = c.from_page_id
+            WHERE {_CITATION_IDENTITY} IN ({placeholders}) ORDER BY p.title
+            """,
+            chunk,
+        )
+        for row in rows:
+            grouped[row["identity"]].append(row)
+    return grouped
+
+
+def list_citations(
+    conn: sqlite3.Connection,
+    *,
+    host: str | None,
+    url: str | None,
+    key: str | None,
+    query: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict[str, object]], int]:
+    """Everything the wiki cites, grouped by source.
+
+    This is the reverse index the `citation` table exists for. `key` or `url`
+    narrows it to one source and answers "which pages cite this?", while `host`
+    gathers a whole domain, which is where a link-rot sweep starts. Registered
+    sources and inline definitions appear side by side because the question
+    being asked — what is this wiki leaning on? — does not care which is which.
+    """
+    conditions: list[str] = []
+    params: list[str] = []
+    if host:
+        conditions.append("COALESCE(NULLIF(s.host, ''), c.host) = ?")
+        params.append(host.strip().lower())
+    if url:
+        conditions.append("COALESCE(NULLIF(s.url, ''), c.url) = ?")
+        params.append(url)
+    if key:
+        conditions.append("c.source_key = ?")
+        params.append(key)
+    if query:
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append(
+            r"(COALESCE(NULLIF(s.url, ''), c.url) LIKE ? ESCAPE '\' "
+            r"OR COALESCE(NULLIF(s.title, ''), c.title) LIKE ? ESCAPE '\' "
+            r"OR c.source_key LIKE ? ESCAPE '\')"
+        )
+        params += [f"%{escaped}%"] * 3
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    joined = f"FROM citation c LEFT JOIN source s ON s.key = c.source_key {where}"
+
+    total = conn.execute(
+        f"SELECT COUNT(*) AS n FROM "
+        f"(SELECT {_CITATION_IDENTITY} AS identity {joined} GROUP BY identity)",
+        params,
+    ).fetchone()["n"]
+    rows = conn.execute(
+        f"""
+        SELECT {_CITATION_IDENTITY} AS identity, c.source_key,
+               MAX(CASE WHEN c.source_key = '' THEN 'inline'
+                        ELSE COALESCE(s.kind, 'missing') END) AS kind,
+               -- a non-empty title beats a blank one
+               MAX(COALESCE(NULLIF(s.title, ''), c.title)) AS title,
+               MAX(COALESCE(NULLIF(s.url, ''), c.url)) AS url,
+               MAX(COALESCE(NULLIF(s.host, ''), c.host)) AS host,
+               COUNT(DISTINCT c.from_page_id) AS page_count
+        {joined}
+        GROUP BY identity
+        ORDER BY page_count DESC, identity
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    ).fetchall()
+
+    grouped = _citing_pages(conn, [row["identity"] for row in rows]) if rows else {}
+    items = [
+        {
+            "source_key": row["source_key"],
+            "kind": row["kind"],
+            "url": row["url"],
+            "host": row["host"],
+            "title": row["title"],
+            "page_count": row["page_count"],
+            "pages": [
+                {"slug": page["slug"], "title": page["title"]}
+                for page in grouped.get(row["identity"], [])
+            ],
+        }
+        for row in rows
+    ]
+    return items, total
+
+
+# --------------------------------------------------------------------------
+# the source registry
+# --------------------------------------------------------------------------
+
+#: A source is one of three things, and the kind decides which fields it needs.
+KIND_LINK = "link"
+KIND_TEXT = "text"
+KIND_FILE = "file"
+SOURCE_KINDS = (KIND_LINK, KIND_TEXT, KIND_FILE)
+
+
+class FileInfo(NamedTuple):
+    filename: str
+    media_type: str
+    byte_size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SourceView:
+    """A registered source, with whatever it carries loaded."""
+
+    key: str
+    kind: str
+    title: str
+    url: str
+    host: str
+    author: str
+    published: str
+    locator: str
+    note: str
+    created_at: str
+    updated_at: str
+    #: The quoted passage, for kind='text'.
+    text: str | None = None
+    #: Set for kind='file', once bytes have been attached.
+    file: FileInfo | None = None
+    #: Pages citing this source right now.
+    page_count: int = 0
+
+
+def _source_row(conn: sqlite3.Connection, key: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM source WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        raise SourceNotFound(key)
+    return row
+
+
+def _source_url(url: str) -> str:
+    """Validate an optional URL on a source. Same rule the body's citations use."""
+    url = url.strip()
+    if url and not markup.external_url(url):
+        raise InvalidSource("A source url must be http or https.", url=url)
+    return url
+
+
+def _citing_page_count(conn: sqlite3.Connection, key: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(DISTINCT from_page_id) AS n FROM citation WHERE source_key = ?",
+        (key,),
+    ).fetchone()["n"]
+
+
+def _file_info(conn: sqlite3.Connection, file_id: int | None) -> FileInfo | None:
+    if file_id is None:
+        return None
+    row = conn.execute(
+        "SELECT filename, media_type, byte_size, sha256 FROM file WHERE id = ?", (file_id,)
+    ).fetchone()
+    return None if row is None else FileInfo(**dict(row))
+
+
+def _source_view(conn: sqlite3.Connection, row: sqlite3.Row) -> SourceView:
+    return SourceView(
+        key=row["key"],
+        kind=row["kind"],
+        title=row["title"],
+        url=row["url"],
+        host=row["host"],
+        author=row["author"],
+        published=row["published"],
+        locator=row["locator"],
+        note=row["note"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        text=None if row["text_id"] is None else load_text(conn, row["text_id"]),
+        file=_file_info(conn, row["file_id"]),
+        page_count=_citing_page_count(conn, row["key"]),
+    )
+
+
+def get_source(conn: sqlite3.Connection, key: str) -> SourceView:
+    return _source_view(conn, _source_row(conn, key))
+
+
+def create_source(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    kind: str,
+    title: str,
+    url: str,
+    text: str,
+    author: str,
+    published: str,
+    locator: str,
+    note: str,
+    settings: Settings,
+) -> SourceView:
+    """Register a source. The kind decides what it must carry."""
+    if kind not in SOURCE_KINDS:
+        raise InvalidSource(
+            f"Unknown source kind {kind!r}; expected one of {', '.join(SOURCE_KINDS)}.",
+            kind=kind,
+        )
+    url = _source_url(url)
+    if kind == KIND_LINK and not url:
+        raise InvalidSource("A link source needs a url.", kind=kind)
+    if kind == KIND_TEXT and not text.strip():
+        raise InvalidSource("A text source needs its text.", kind=kind)
+    if kind != KIND_TEXT and text:
+        raise InvalidSource(f"Only a text source carries text; this is a {kind} source.", kind=kind)
+    _check_size(text, settings)
+
+    now = _now()
+    with write_tx(conn):
+        if conn.execute("SELECT 1 FROM source WHERE key = ?", (key,)).fetchone():
+            raise SourceConflict(key)
+        # A file source starts empty; the bytes arrive in a second request.
+        text_id = (
+            store_text(conn, text, settings.compress_min_bytes)[0]
+            if kind == KIND_TEXT
+            else None
+        )
+        conn.execute(
+            """
+            INSERT INTO source
+                (key, kind, title, url, host, text_id, author, published, locator, note,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                kind,
+                title,
+                url,
+                markup.url_host(url),
+                text_id,
+                author,
+                published,
+                locator,
+                note,
+                now,
+                now,
+            ),
+        )
+    return get_source(conn, key)
+
+
+def update_source(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    title: str | None,
+    url: str | None,
+    text: str | None,
+    author: str | None,
+    published: str | None,
+    locator: str | None,
+    note: str | None,
+    settings: Settings,
+) -> SourceView:
+    """Correct a source in place. Fields left out keep their value.
+
+    Every page citing it shows the correction on the next read — that is the
+    reason the registry exists. The `kind` and the `key` are not editable: the
+    kind is what the source *is*, and the key is the name bodies wrote down.
+    """
+    now = _now()
+    with write_tx(conn):
+        row = _source_row(conn, key)
+        if text is not None and row["kind"] != KIND_TEXT:
+            raise InvalidSource(
+                f"Only a text source carries text; {key!r} is a {row['kind']} source.",
+                key=key,
+                kind=row["kind"],
+            )
+
+        updates: dict[str, object] = {}
+        if title is not None:
+            updates["title"] = title
+        if url is not None:
+            checked = _source_url(url)
+            if row["kind"] == KIND_LINK and not checked:
+                raise InvalidSource("A link source needs a url.", key=key)
+            updates["url"] = checked
+            updates["host"] = markup.url_host(checked)
+        for column, value in (
+            ("author", author),
+            ("published", published),
+            ("locator", locator),
+            ("note", note),
+        ):
+            if value is not None:
+                updates[column] = value
+
+        old_text_id = row["text_id"]
+        if text is not None:
+            if not text.strip():
+                raise InvalidSource("A text source needs its text.", key=key)
+            _check_size(text, settings)
+            updates["text_id"] = store_text(conn, text, settings.compress_min_bytes)[0]
+
+        if updates:
+            updates["updated_at"] = now
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            conn.execute(
+                f"UPDATE source SET {assignments} WHERE id = ?",
+                (*updates.values(), row["id"]),
+            )
+        if text is not None and old_text_id is not None:
+            # Nothing else can point at a source's body, so it goes with it.
+            delete_texts(conn, [old_text_id])
+    return get_source(conn, key)
+
+
+def delete_source(conn: sqlite3.Connection, key: str) -> int:
+    """Unregister a source. Returns how many pages are left citing nothing.
+
+    Citations are not rewritten — the bodies still say ``[^@key]``, and they
+    now render as missing. Deleting a page a wikilink points at does the same
+    thing, and for the same reason: the body owns its own text.
+    """
+    with write_tx(conn):
+        row = _source_row(conn, key)
+        dangling = _citing_page_count(conn, key)
+        conn.execute("DELETE FROM source WHERE id = ?", (row["id"],))
+        if row["text_id"] is not None:
+            delete_texts(conn, [row["text_id"]])
+        if row["file_id"] is not None:
+            _drop_orphan_file(conn, row["file_id"])
+    return dangling
+
+
+def list_sources(
+    conn: sqlite3.Connection,
+    *,
+    kind: str | None,
+    host: str | None,
+    query: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[sqlite3.Row], int]:
+    conditions: list[str] = []
+    params: list[str] = []
+    if kind:
+        conditions.append("kind = ?")
+        params.append(kind)
+    if host:
+        conditions.append("host = ?")
+        params.append(host.strip().lower())
+    if query:
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append(
+            r"(key LIKE ? ESCAPE '\' OR title LIKE ? ESCAPE '\' "
+            r"OR author LIKE ? ESCAPE '\' OR url LIKE ? ESCAPE '\')"
+        )
+        params += [f"%{escaped}%"] * 4
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    total = conn.execute(f"SELECT COUNT(*) AS n FROM source {where}", params).fetchone()["n"]
+    rows = conn.execute(
+        f"""
+        SELECT s.key, s.kind, s.title, s.url, s.host, s.author, s.published,
+               s.locator, s.note, s.created_at, s.updated_at,
+               (SELECT COUNT(DISTINCT from_page_id) FROM citation
+                 WHERE source_key = s.key) AS page_count
+        FROM source s {where}
+        ORDER BY s.updated_at DESC, s.key
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    ).fetchall()
+    return rows, total
+
+
+def source_citations(conn: sqlite3.Connection, key: str) -> list[sqlite3.Row]:
+    """Pages citing this source. The reverse index, one source at a time."""
+    _source_row(conn, key)
+    return conn.execute(
+        """
+        SELECT DISTINCT p.slug, p.title, p.updated_at
+        FROM citation c JOIN page p ON p.id = c.from_page_id
+        WHERE c.source_key = ? ORDER BY p.title
+        """,
+        (key,),
+    ).fetchall()
+
+
+# --------------------------------------------------------------------------
+# source files
+# --------------------------------------------------------------------------
+
+
+def _drop_orphan_file(conn: sqlite3.Connection, file_id: int) -> None:
+    """Delete a file row no source points at any more.
+
+    File rows are content-addressed and therefore shared, so this has to ask
+    rather than assume.
+    """
+    if conn.execute("SELECT 1 FROM source WHERE file_id = ?", (file_id,)).fetchone() is None:
+        conn.execute("DELETE FROM file WHERE id = ?", (file_id,))
+
+
+def attach_file(
+    conn: sqlite3.Connection,
+    *,
+    key: str,
+    data: bytes,
+    filename: str,
+    media_type: str,
+    settings: Settings,
+) -> SourceView:
+    """Store the bytes of a file source, replacing anything already there."""
+    if len(data) > settings.max_file_bytes:
+        raise FileTooLarge(len(data), settings.max_file_bytes)
+    if not data:
+        raise InvalidSource("An upload cannot be empty.", key=key)
+
+    digest = hashlib.sha256(data).hexdigest()
+    now = _now()
+    with write_tx(conn):
+        row = _source_row(conn, key)
+        if row["kind"] != KIND_FILE:
+            raise InvalidSource(
+                f"Only a file source takes an upload; {key!r} is a {row['kind']} source.",
+                key=key,
+                kind=row["kind"],
+            )
+        existing = conn.execute("SELECT id FROM file WHERE sha256 = ?", (digest,)).fetchone()
+        if existing is None:
+            file_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO file
+                        (sha256, media_type, filename, byte_size, data, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (digest, media_type, filename, len(data), data, now),
+                ).lastrowid
+            )
+        else:
+            # Same bytes already here; the first upload's name and type stand.
+            file_id = int(existing["id"])
+
+        previous = row["file_id"]
+        conn.execute(
+            "UPDATE source SET file_id = ?, updated_at = ? WHERE id = ?",
+            (file_id, now, row["id"]),
+        )
+        if previous is not None and previous != file_id:
+            _drop_orphan_file(conn, previous)
+    return get_source(conn, key)
+
+
+def load_file(conn: sqlite3.Connection, key: str) -> tuple[bytes, FileInfo]:
+    """The bytes of a file source, for handing back over HTTP."""
+    row = _source_row(conn, key)
+    if row["file_id"] is None:
+        raise FileNotAttached(key)
+    stored = conn.execute(
+        "SELECT data, filename, media_type, byte_size, sha256 FROM file WHERE id = ?",
+        (row["file_id"],),
+    ).fetchone()
+    if stored is None:  # pragma: no cover - only reachable if the DB is corrupt
+        raise FileNotAttached(key)
+    return bytes(stored["data"]), FileInfo(
+        filename=stored["filename"],
+        media_type=stored["media_type"],
+        byte_size=stored["byte_size"],
+        sha256=stored["sha256"],
+    )
+
+
+# --------------------------------------------------------------------------
 # writes
 # --------------------------------------------------------------------------
 
@@ -365,6 +986,37 @@ def _record_links(conn: sqlite3.Connection, page_id: int, content: str) -> None:
         conn.executemany(
             "INSERT INTO pagelink (from_page_id, to_slug) VALUES (?, ?)",
             [(page_id, target) for target in targets],
+        )
+
+
+def _record_citations(conn: sqlite3.Connection, page_id: int, content: str) -> None:
+    """Replace this page's cited sources. Mirrors _record_links exactly.
+
+    A registry reference stores its key and nothing else. Copying the source's
+    title in here would be a second copy to keep correct, and the whole point
+    of the registry is that there is one.
+    """
+    conn.execute("DELETE FROM citation WHERE from_page_id = ?", (page_id,))
+    citations = markup.extract_citations(content)
+    if citations:
+        conn.executemany(
+            """
+            INSERT INTO citation
+                (from_page_id, name, ordinal, source_key, url, title, host)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    page_id,
+                    cite.name,
+                    cite.ordinal,
+                    cite.source_key,
+                    cite.url,
+                    cite.title,
+                    cite.host,
+                )
+                for cite in citations
+            ],
         )
 
 
@@ -473,6 +1125,7 @@ def create_page(
         conn.execute("UPDATE page SET latest_rev_id = ? WHERE id = ?", (rev_id, page_id))
         _index_page(conn, page_id, slug, title, content)
         _record_links(conn, page_id, content)
+        _record_citations(conn, page_id, content)
     return get_page(conn, slug, settings)
 
 
@@ -524,6 +1177,7 @@ def update_page(
             )
             _index_page(conn, page["id"], slug, new_title, content)
             _record_links(conn, page["id"], content)
+            _record_citations(conn, page["id"], content)
             _drop_stale_cache(conn, page["id"], rev_id)
             changed = True
     return get_page(conn, slug, settings), changed

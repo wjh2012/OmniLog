@@ -18,8 +18,13 @@ class Settings:
     compress_min_bytes: int = 512
     #: Prefix used when a [[wikilink]] is turned into an href.
     link_base: str = "/pages"
+    #: Prefix used when a registered source is turned into an href.
+    source_base: str = "/sources"
     #: Upper bound on one revision body, in bytes of UTF-8.
     max_content_bytes: int = 2 * 1024 * 1024
+    #: Upper bound on one uploaded source file. Files live in the database, so
+    #: this is the knob that keeps the database file from becoming an archive.
+    max_file_bytes: int = 10 * 1024 * 1024
 
 
 def load_settings() -> Settings:

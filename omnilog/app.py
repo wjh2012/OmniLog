@@ -16,9 +16,13 @@ from .errors import WikiError
 DESCRIPTION = """
 A wiki served as JSON.
 
-Page bodies are markdown with `[[wikilink]]` support. Every save appends a
-revision; nothing is ever overwritten in place, so history and diffs stay
-available.
+Page bodies are markdown with `[[wikilink]]` support, plus citations for
+pointing a sentence at where it came from: `[^name]` with a definition line for
+a one-off, or `[^@key]` for a source in the registry — a link, a quoted passage
+or an uploaded file, managed apart from any page and correctable in one place.
+
+Every save appends a revision; nothing is ever overwritten in place, so history
+and diffs stay available.
 """
 
 

@@ -59,6 +59,133 @@ GET http://127.0.0.1:8000/api/pages/fastapi-guide/backlinks
 Accept: application/json
 
 ###
+# 출처를 단 문서. [^이름]으로 문장에 표시하고 아래에서 정의합니다.
+
+POST http://127.0.0.1:8000/api/pages
+Content-Type: application/json
+
+{
+  "title": "델타 압축",
+  "content": "위키피디아는 델타 기반 시스템을 사용한다.[^mw-text]\n압축은 별도 작업으로 돌린다.[^mw-text] Git도 같은 구조다.[^git-gc]\n\n[^mw-text]: https://www.mediawiki.org/wiki/Manual:Text_table \"MediaWiki Manual: Text table\"\n[^git-gc]: https://git-scm.com/docs/git-gc \"git-gc\"\n",
+  "author": "jin"
+}
+
+###
+
+GET http://127.0.0.1:8000/api/pages/델타-압축/citations
+Accept: application/json
+
+###
+# 여러 문서가 공유할 출처는 레지스트리에 등록합니다. 종류가 셋: link / text / file.
+
+POST http://127.0.0.1:8000/api/sources
+Content-Type: application/json
+
+{
+  "key": "mw-text-table",
+  "kind": "link",
+  "title": "MediaWiki Manual: Text table",
+  "url": "https://www.mediawiki.org/wiki/Manual:Text_table",
+  "author": "MediaWiki",
+  "published": "2024",
+  "locator": "Storage 절"
+}
+
+###
+# 웹에 없는 자료는 인용문 자체를 담습니다.
+
+POST http://127.0.0.1:8000/api/sources
+Content-Type: application/json
+
+{
+  "key": "kim-2004",
+  "kind": "text",
+  "title": "한국어 정보검색",
+  "text": "트라이그램 색인은 부분 문자열 검색을 가능하게 한다.",
+  "author": "김",
+  "published": "2004",
+  "locator": "112쪽"
+}
+
+###
+# 파일 출처는 먼저 등록하고 바이트를 따로 올립니다.
+
+POST http://127.0.0.1:8000/api/sources
+Content-Type: application/json
+
+{ "key": "scan-01", "kind": "file", "title": "원본 스캔" }
+
+###
+# 본문이 곧 파일입니다. Content-Type이 미디어 타입이 됩니다.
+
+PUT http://127.0.0.1:8000/api/sources/scan-01/file?filename=스캔.pdf
+Content-Type: application/pdf
+
+< ./scan.pdf
+
+###
+
+GET http://127.0.0.1:8000/api/sources/scan-01/file
+
+###
+# 등록된 출처는 정의 줄 없이 [^@키]로 인용합니다.
+
+POST http://127.0.0.1:8000/api/pages
+Content-Type: application/json
+
+{
+  "title": "저장 구조",
+  "content": "위키피디아는 델타를 쓴다.[^@mw-text-table]\n한국어 검색은 트라이그램이 필요하다.[^@kim-2004]\n아직 등록 안 한 출처도 쓸 수 있다.[^@나중에]\n"
+}
+
+###
+# 출처를 고치면 인용한 문서 전부가 다음 읽기에서 새 값을 봅니다.
+
+PUT http://127.0.0.1:8000/api/sources/mw-text-table
+Content-Type: application/json
+
+{ "title": "MediaWiki: text 테이블" }
+
+###
+
+GET http://127.0.0.1:8000/api/pages/저장-구조
+Accept: application/json
+
+###
+# 이 출처를 인용한 문서들.
+
+GET http://127.0.0.1:8000/api/sources/mw-text-table/citations
+Accept: application/json
+
+###
+
+GET http://127.0.0.1:8000/api/sources?kind=text
+Accept: application/json
+
+###
+# 등록 해제. 인용은 끊어진 채 남고, 몇 개인지는 헤더로 알려줍니다.
+
+DELETE http://127.0.0.1:8000/api/sources/kim-2004
+
+###
+# 위키가 인용하는 모든 것, 많이 인용된 순서. 등록된 출처와 일회성 정의가 함께 나옵니다.
+
+GET http://127.0.0.1:8000/api/citations
+Accept: application/json
+
+###
+# 역인덱스 — 이 URL을 인용한 문서 전부.
+
+GET http://127.0.0.1:8000/api/citations?url=https://git-scm.com/docs/git-gc
+Accept: application/json
+
+###
+# 도메인 하나가 죽었을 때 손봐야 할 문서 전부.
+
+GET http://127.0.0.1:8000/api/citations?host=www.mediawiki.org
+Accept: application/json
+
+###
 
 POST http://127.0.0.1:8000/api/pages/위키-시스템/rename
 Content-Type: application/json

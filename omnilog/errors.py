@@ -93,3 +93,47 @@ class ContentTooLarge(WikiError):
             size=size,
             limit=limit,
         )
+
+
+class SourceNotFound(WikiError):
+    status_code = 404
+    code = "source_not_found"
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"No source registered as {key!r}.", key=key)
+
+
+class SourceConflict(WikiError):
+    status_code = 409
+    code = "source_conflict"
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"A source is already registered as {key!r}.", key=key)
+
+
+class InvalidSource(WikiError):
+    """The fields do not add up to a usable source of the requested kind."""
+
+    status_code = 400
+    code = "invalid_source"
+
+    def __init__(self, reason: str, **details: object) -> None:
+        super().__init__(reason, **details)
+
+
+class FileNotAttached(WikiError):
+    status_code = 404
+    code = "file_not_attached"
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"Source {key!r} has no file attached yet.", key=key)
+
+
+class FileTooLarge(WikiError):
+    status_code = 413
+    code = "file_too_large"
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(
+            f"Upload is {size} bytes, over the {limit} byte limit.", size=size, limit=limit
+        )
