@@ -1,0 +1,15 @@
+{
+  "name": "omnilog-wiki-sync",
+  "displayName": "OmniLog Wiki Sync",
+  "version": "0.1.0",
+  "description": "기능을 구현하거나 수정할 때 OmniLog 자체 MCP 서버(omnilog)를 통해 관련 위키 문서를 등록·갱신하는 스킬과, 소스가 바뀌면 이를 상기시키는 훅을 제공합니다.",
+  "author": {
+    "name": "OmniLog"
+  },
+  "mcpServers": {
+    "omnilog": {
+      "type": "http",
+      "url": "${OMNILOG_MCP_URL:-http://127.0.0.1:8000/mcp}"
+    }
+  }
+}

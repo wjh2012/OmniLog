@@ -1,0 +1,14 @@
+{
+  "name": "omnilog-marketplace",
+  "description": "OmniLog 저장소 전용 로컬 플러그인 마켓플레이스",
+  "owner": {
+    "name": "OmniLog"
+  },
+  "plugins": [
+    {
+      "name": "omnilog-wiki-sync",
+      "source": ".",
+      "description": "기능 구현/수정 시 OmniLog 자체 MCP로 위키 문서를 등록/갱신"
+    }
+  ]
+}
