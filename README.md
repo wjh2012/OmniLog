@@ -19,6 +19,23 @@ uv run pytest
 슬러그·리비전·트라이그램처럼 이 문서에 나오는 용어는 [용어집](GLOSSARY.md)에
 정리해두었습니다.
 
+## MCP
+
+REST 라우트는 `/mcp`에도 그대로 MCP 툴로 노출됩니다(`fastmcp`). 기본값(PoC 단계)은
+`OMNILOG_API_KEYS`가 비어 있으면 REST·MCP 모두 인증 없이 열려 있습니다.
+
+배포 전에는 `OMNILOG_API_KEYS`에 `{"토큰": ["역할", ...]}` 형태의 JSON을 넣어 잠급니다.
+역할은 `viewer`(읽기) / `editor`(쓰기) / `admin`(`/api/maintenance/compact`)이고, 상위
+역할을 쓰려면 하위 역할도 같이 나열해야 합니다.
+
+```bash
+export OMNILOG_API_KEYS='{"sk-viewer-...": ["viewer"], "sk-admin-...": ["viewer", "editor", "admin"]}'
+```
+
+이 키가 설정되면 REST 요청은 `Authorization: Bearer <토큰>` 헤더가 필요하고, MCP
+쪽에서는 같은 토큰이 보유한 역할만큼만 툴 목록에 나타나고 호출할 수 있습니다
+(`omnilog/auth.py`, `omnilog/mcp.py`).
+
 ## 엔드포인트
 
 | 메서드 | 경로 | 용도 |
