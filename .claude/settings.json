@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "omnilog-marketplace": {
+      "source": {
+        "source": "directory",
+        "path": "."
+      }
+    }
+  },
+  "enabledPlugins": {
+    "omnilog-wiki-sync@omnilog-marketplace": true
+  }
+}
