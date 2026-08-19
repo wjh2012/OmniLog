@@ -50,7 +50,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={"code": exc.code, "message": exc.message, "details": exc.details},
         )
 
-    @app.get("/api/health", tags=["meta"], summary="Liveness probe")
+    @app.get(
+        "/api/health", tags=["meta"], summary="Liveness probe", operation_id="health"
+    )
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 

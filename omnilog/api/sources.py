@@ -95,6 +95,7 @@ def _detail(view: SourceView) -> dict:
     response_model=SourceDetail,
     status_code=status.HTTP_201_CREATED,
     summary="Register a source",
+    operation_id="create_source",
     description=(
         "kind='link' needs a url, kind='text' needs its text, kind='file' takes "
         "its bytes afterwards through PUT /sources/{key}/file."
@@ -124,6 +125,7 @@ def create_source(payload: SourceCreate, conn: Conn, settings: Config) -> dict:
     "/sources",
     response_model=SourceList,
     summary="List registered sources",
+    operation_id="list_sources",
     dependencies=_viewer,
 )
 def list_sources(
@@ -151,6 +153,7 @@ def list_sources(
     "/sources/{key}",
     response_model=SourceDetail,
     summary="Read a source",
+    operation_id="read_source",
     dependencies=_viewer,
 )
 def read_source(conn: Conn, key: str = KeyPath) -> dict:
@@ -161,6 +164,7 @@ def read_source(conn: Conn, key: str = KeyPath) -> dict:
     "/sources/{key}",
     response_model=SourceDetail,
     summary="Correct a source",
+    operation_id="update_source",
     tags=[EDITOR_TAG],
     dependencies=_editor,
 )
@@ -186,6 +190,7 @@ def update_source(
     "/sources/{key}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Unregister a source",
+    operation_id="delete_source",
     description=(
         "Page bodies still say [^@key], so their citations start rendering as "
         "missing — the same thing that happens to a wikilink when its page goes. "
@@ -206,6 +211,7 @@ def delete_source(conn: Conn, key: str = KeyPath) -> Response:
     "/sources/{key}/citations",
     response_model=SourceCitations,
     summary="Pages citing this source",
+    operation_id="source_citations",
     dependencies=_viewer,
 )
 def source_citations(conn: Conn, key: str = KeyPath) -> dict:
@@ -218,6 +224,7 @@ def source_citations(conn: Conn, key: str = KeyPath) -> dict:
     "/sources/{key}/file",
     response_model=SourceDetail,
     summary="Attach or replace the file of a file source",
+    operation_id="upload_source_file",
     description=(
         "The request body is the file itself, and Content-Type is taken as its "
         "media type. Raw bytes rather than multipart: this API speaks JSON and "
@@ -264,6 +271,7 @@ async def upload_source_file(
     "/sources/{key}/file",
     response_class=Response,
     summary="Download the file of a file source",
+    operation_id="download_source_file",
     responses={200: {"content": {"*/*": {}}, "description": "The stored bytes"}},
     dependencies=_viewer,
 )

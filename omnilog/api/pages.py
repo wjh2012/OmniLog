@@ -333,6 +333,7 @@ def page_backlinks(conn: Conn, slug: str = SlugPath) -> dict:
     "/pages/{slug}/citations",
     response_model=PageCitations,
     summary="External sources this page cites",
+    operation_id="page_citations",
     description=(
         "Read from the citation index rather than the body, so it costs no "
         "render. Only sources the body actually refers to are listed."

@@ -16,6 +16,7 @@ router = APIRouter()
     "/citations",
     response_model=CitationList,
     summary="List everything the wiki cites, grouped by source",
+    operation_id="list_citations",
     description=(
         "Registered sources and inline definitions side by side, most-cited "
         "first, each with the pages citing it. `key` or `url` narrows it to one "

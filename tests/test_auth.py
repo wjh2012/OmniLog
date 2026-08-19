@@ -118,19 +118,24 @@ PLACEHOLDERS = {"{slug}": "nope", "{key}": "nope", "{number}": "1"}
 
 
 def _api_operations(app):
-    """(path, METHOD, tags) for every documented /api route."""
+    """(path, METHOD, tags, operationId) for every documented /api route."""
     for path, operations in app.openapi()["paths"].items():
         if not path.startswith("/api"):
             continue
         for method, operation in operations.items():
             if method.upper() in WRITE_METHODS | {"GET"}:
-                yield path, method.upper(), set(operation.get("tags", []))
+                yield (
+                    path,
+                    method.upper(),
+                    set(operation.get("tags", [])),
+                    operation.get("operationId", ""),
+                )
 
 
 def test_every_api_route_requires_a_token(guarded_client) -> None:
     """A new route that forgets its role gate is open to the world; catch it here."""
     open_to_anyone = []
-    for path, method, _ in _api_operations(guarded_client.app):
+    for path, method, _, _tool in _api_operations(guarded_client.app):
         if (path, method) in OPEN_ROUTES:
             continue
         url = path
@@ -142,11 +147,26 @@ def test_every_api_route_requires_a_token(guarded_client) -> None:
     assert open_to_anyone == []
 
 
+def test_every_route_names_its_mcp_tool(guarded_client) -> None:
+    """operationId is the MCP tool name; FastAPI's generated one is unusable.
+
+    Left to itself FastAPI builds it from the path, so a route without an
+    explicit operation_id turns into a tool called something like
+    `read_source_api_sources__key__get`.
+    """
+    generated = [
+        f"{method} {path} -> {operation_id}"
+        for path, method, _, operation_id in _api_operations(guarded_client.app)
+        if "_api_" in operation_id
+    ]
+    assert generated == []
+
+
 def test_every_write_route_is_tagged_for_mcp(guarded_client) -> None:
     """The MCP side gates on the tag, not the dependency: the two must agree."""
     untagged = [
         f"{method} {path}"
-        for path, method, tags in _api_operations(guarded_client.app)
+        for path, method, tags, _tool in _api_operations(guarded_client.app)
         if method in WRITE_METHODS and not tags & ROLE_TAGS
     ]
     assert untagged == []
