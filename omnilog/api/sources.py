@@ -10,11 +10,12 @@ from __future__ import annotations
 import re
 from urllib.parse import quote
 
-from fastapi import APIRouter, Path, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from starlette.concurrency import run_in_threadpool
 
 from .. import repository
-from ..deps import Config, Conn
+from ..auth import EDITOR, VIEWER
+from ..deps import Config, Conn, require_role
 from ..errors import FileTooLarge, SourceNotFound
 from ..repository import SourceView
 from ..schemas import (
@@ -33,6 +34,11 @@ from ..slug import slugify
 router = APIRouter()
 
 KeyPath = Path(min_length=1, max_length=300, description="Source key")
+
+# Tags double as the MCP scope gate: see omnilog.mcp.restrict_tag wiring.
+EDITOR_TAG = "role-editor"
+_editor = [Depends(require_role(EDITOR))]
+_viewer = [Depends(require_role(VIEWER))]
 
 #: Types safe to render in the browser tab. Anything else is handed over as a
 #: download: an uploaded .html or .svg served inline would be a script running
@@ -93,6 +99,8 @@ def _detail(view: SourceView) -> dict:
         "kind='link' needs a url, kind='text' needs its text, kind='file' takes "
         "its bytes afterwards through PUT /sources/{key}/file."
     ),
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def create_source(payload: SourceCreate, conn: Conn, settings: Config) -> dict:
     title = payload.title.strip()
@@ -112,7 +120,12 @@ def create_source(payload: SourceCreate, conn: Conn, settings: Config) -> dict:
     return _detail(view)
 
 
-@router.get("/sources", response_model=SourceList, summary="List registered sources")
+@router.get(
+    "/sources",
+    response_model=SourceList,
+    summary="List registered sources",
+    dependencies=_viewer,
+)
 def list_sources(
     conn: Conn,
     kind: str | None = Query(default=None, description="link, text or file"),
@@ -134,12 +147,23 @@ def list_sources(
     }
 
 
-@router.get("/sources/{key}", response_model=SourceDetail, summary="Read a source")
+@router.get(
+    "/sources/{key}",
+    response_model=SourceDetail,
+    summary="Read a source",
+    dependencies=_viewer,
+)
 def read_source(conn: Conn, key: str = KeyPath) -> dict:
     return _detail(repository.get_source(conn, _normalise(key)))
 
 
-@router.put("/sources/{key}", response_model=SourceDetail, summary="Correct a source")
+@router.put(
+    "/sources/{key}",
+    response_model=SourceDetail,
+    summary="Correct a source",
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
+)
 def update_source(
     payload: SourceUpdate, conn: Conn, settings: Config, key: str = KeyPath
 ) -> dict:
@@ -167,6 +191,8 @@ def update_source(
         "missing — the same thing that happens to a wikilink when its page goes. "
         "X-Dangling-Citations reports how many pages that is."
     ),
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 def delete_source(conn: Conn, key: str = KeyPath) -> Response:
     dangling = repository.delete_source(conn, _normalise(key))
@@ -180,6 +206,7 @@ def delete_source(conn: Conn, key: str = KeyPath) -> Response:
     "/sources/{key}/citations",
     response_model=SourceCitations,
     summary="Pages citing this source",
+    dependencies=_viewer,
 )
 def source_citations(conn: Conn, key: str = KeyPath) -> dict:
     resolved = _normalise(key)
@@ -196,6 +223,8 @@ def source_citations(conn: Conn, key: str = KeyPath) -> dict:
         "media type. Raw bytes rather than multipart: this API speaks JSON and "
         "one upload does not justify a form parser."
     ),
+    tags=[EDITOR_TAG],
+    dependencies=_editor,
 )
 async def upload_source_file(
     request: Request,
@@ -236,6 +265,7 @@ async def upload_source_file(
     response_class=Response,
     summary="Download the file of a file source",
     responses={200: {"content": {"*/*": {}}, "description": "The stored bytes"}},
+    dependencies=_viewer,
 )
 def download_source_file(conn: Conn, key: str = KeyPath) -> Response:
     data, info = repository.load_file(conn, _normalise(key))

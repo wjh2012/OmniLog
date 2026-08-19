@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from .. import repository
-from ..deps import Conn
+from ..auth import VIEWER
+from ..deps import Conn, require_role
 from ..schemas import CitationList
 
 router = APIRouter()
@@ -21,6 +22,7 @@ router = APIRouter()
         "source, which is the reverse lookup: who cites this? `host` gathers a "
         "whole domain, which is where a link-rot sweep starts."
     ),
+    dependencies=[Depends(require_role(VIEWER))],
 )
 def list_citations(
     conn: Conn,

@@ -6,19 +6,25 @@ here, separately, the way `git gc` is separate from `git commit`.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from .. import repository
-from ..deps import Config, Conn
+from ..auth import ADMIN
+from ..deps import Config, Conn, require_role
 from ..schemas import CompactResult
 
 router = APIRouter()
+
+ADMIN_TAG = "role-admin"
 
 
 @router.post(
     "/maintenance/compact",
     response_model=CompactResult,
     summary="Re-encode older revision bodies as deltas and bundle them",
+    operation_id="compact_storage",
+    tags=[ADMIN_TAG],
+    dependencies=[Depends(require_role(ADMIN))],
 )
 def compact(
     conn: Conn,

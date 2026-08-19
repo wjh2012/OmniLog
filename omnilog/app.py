@@ -12,6 +12,7 @@ from .api import api_router
 from .config import Settings, load_settings
 from .db import init_db
 from .errors import WikiError
+from .mcp import mount_mcp
 
 DESCRIPTION = """
 A wiki served as JSON.
@@ -54,4 +55,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(api_router, prefix="/api")
+    mount_mcp(app, resolved)
     return app
