@@ -26,6 +26,7 @@ from .errors import (
     RedirectConflict,
     RedirectNotFound,
     RevisionNotFound,
+    SectionNotFound,
     SlugConflict,
     SourceConflict,
     SourceNotFound,
@@ -76,6 +77,20 @@ class PageView:
     links: tuple[LinkInfo, ...]
     #: External sources this revision cites, numbered.
     citations: tuple[Citation, ...] = ()
+    #: Set when the caller asked for one of the page's old names.
+    redirected_from: str | None = None
+
+
+@dataclass(frozen=True)
+class SectionView:
+    """One heading of a page, sliced out by itself and rendered on its own."""
+
+    slug: str
+    anchor: str
+    level: int
+    title: str
+    content: str
+    html: str
     #: Set when the caller asked for one of the page's old names.
     redirected_from: str | None = None
 
@@ -375,6 +390,74 @@ def get_revision(
     page, redirected_from = _resolve_slug(conn, slug)
     revision = _revision_row(conn, page["id"], number, page["slug"])
     return _view(conn, page, revision, settings, redirected_from)
+
+
+def get_outline(conn: sqlite3.Connection, slug: str) -> tuple[tuple[markup.Heading, ...], str]:
+    """The table of contents of the page reachable from `slug`.
+
+    Loads the body but never renders it, so a caller can see a page's shape --
+    and decide whether a section of it is worth reading in full -- for the
+    cost of a text load rather than a render.
+    """
+    page, _ = _resolve_slug(conn, slug)
+    content = load_text(conn, _latest_revision(conn, page)["text_id"])
+    return markup.extract_headings(content), page["slug"]
+
+
+def _next_boundary(
+    headings: Sequence[markup.Heading], target: markup.Heading
+) -> int | None:
+    """Line the section after `target` starts on, or None if it runs to the end."""
+    for heading in headings:
+        if heading.line > target.line and heading.level <= target.level:
+            return heading.line
+    return None
+
+
+def get_section(
+    conn: sqlite3.Connection, slug: str, anchor: str, settings: Settings
+) -> SectionView:
+    """One heading of the page reachable from `slug`, plus everything under it.
+
+    A section runs until the next heading at the same level or shallower, so
+    it always carries its own subsections along -- the same rule Wikipedia's
+    "edit section" link uses. Rendered fresh, the way a historical revision is:
+    a fragment is not worth a render_cache row of its own.
+    """
+    page, redirected_from = _resolve_slug(conn, slug)
+    content = load_text(conn, _latest_revision(conn, page)["text_id"])
+    headings = markup.extract_headings(content)
+    target = next((heading for heading in headings if heading.anchor == anchor), None)
+    if target is None:
+        raise SectionNotFound(page["slug"], anchor)
+
+    lines = content.splitlines()
+    section_content = "\n".join(lines[target.line : _next_boundary(headings, target)])
+    rendered = markup.render(
+        section_content,
+        lambda targets: resolve_links(conn, targets),
+        settings.link_base,
+        resolve_sources=lambda keys: resolve_sources(conn, keys),
+        source_base=settings.source_base,
+    )
+    html = rendered.html
+    if rendered.headings:
+        # The slice is parsed on its own, so its first heading -- always
+        # `target` itself -- gets renumbered from a clean slate and may not
+        # land on the same anchor a duplicate heading earned in the full
+        # document. Force the id back to the one `anchor` actually names.
+        local_id = rendered.headings[0].anchor
+        if local_id != target.anchor:
+            html = html.replace(f'id="{local_id}"', f'id="{target.anchor}"', 1)
+    return SectionView(
+        slug=page["slug"],
+        anchor=target.anchor,
+        level=target.level,
+        title=target.text,
+        content=section_content,
+        html=html,
+        redirected_from=redirected_from,
+    )
 
 
 def list_pages(conn: sqlite3.Connection, limit: int, offset: int) -> tuple[list[sqlite3.Row], int]:

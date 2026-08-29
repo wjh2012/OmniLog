@@ -6,7 +6,7 @@ def test_create_and_read(client, make_page) -> None:
     assert created["slug"] == "getting-started"
     assert created["revision"]["number"] == 1
     assert created["revision"]["author"] == "jin"
-    assert "<h1>Hi</h1>" in created["html"]
+    assert '<h1 id="hi">Hi</h1>' in created["html"]
 
     fetched = client.get("/api/pages/getting-started").json()
     assert fetched["content"] == "# Hi\n\nwelcome"
@@ -120,3 +120,53 @@ def test_backlinks_survive_target_deletion(client, make_page) -> None:
     assert client.get("/api/pages/referrer").json()["links"] == [
         {"slug": "target", "exists": False, "via_redirect": False}
     ]
+
+
+def test_outline_lists_headings_in_order(client, make_page) -> None:
+    make_page("Guide", "# Guide\n\nintro\n\n## Setup\n\ntext\n\n## Usage\n\ntext\n")
+    body = client.get("/api/pages/guide/outline").json()
+    assert body["slug"] == "guide"
+    assert [item["anchor"] for item in body["items"]] == ["guide", "setup", "usage"]
+    # No body or html: an outline is meant to be cheap next to a full read.
+    assert "content" not in body and "html" not in body
+
+
+def test_outline_follows_a_renamed_page(client, make_page) -> None:
+    make_page("Old Name", "# Old Name\n")
+    client.post("/api/pages/old-name/rename", json={"slug": "New Name"})
+    body = client.get("/api/pages/old-name/outline").json()
+    assert body["slug"] == "new-name"
+
+
+def test_read_section_covers_its_own_subsections_but_not_the_next_one(
+    client, make_page
+) -> None:
+    make_page(
+        "Guide",
+        "# Guide\n\nintro\n\n## Setup\n\nstep one\n\n### Details\n\nmore\n\n"
+        "## Usage\n\nhow to\n",
+    )
+    section = client.get("/api/pages/guide/sections/setup").json()
+    assert section["title"] == "Setup"
+    assert section["level"] == 2
+    assert "step one" in section["content"]
+    assert "Details" in section["content"]
+    assert "how to" not in section["content"]
+    assert '<h2 id="setup">Setup</h2>' in section["html"]
+
+
+def test_section_html_id_matches_anchor_even_for_a_duplicate_heading(
+    client, make_page
+) -> None:
+    """The slice is re-parsed alone, so its own heading could relabel itself."""
+    make_page("Guide", "## Notes\n\nfirst.\n\n## Notes\n\nsecond.\n")
+    section = client.get("/api/pages/guide/sections/notes-2").json()
+    assert section["anchor"] == "notes-2"
+    assert '<h2 id="notes-2">Notes</h2>' in section["html"]
+
+
+def test_unknown_section_is_404(client, make_page) -> None:
+    make_page("Guide", "# Guide\n")
+    response = client.get("/api/pages/guide/sections/nope")
+    assert response.status_code == 404
+    assert response.json()["code"] == "section_not_found"

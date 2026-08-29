@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from omnilog.markup import extract_links, render
+from omnilog.markup import extract_headings, extract_links, render
 
 
 def _render(
@@ -77,3 +77,33 @@ def test_wikilink_inside_emphasis() -> None:
     result = _render("*[[Target]]*", {"target"})
     assert "<em>" in result.html
     assert result.slugs == ("target",)
+
+
+def test_extract_headings_in_document_order() -> None:
+    headings = extract_headings("# Title\n\nintro\n\n## Section A\n\ntext\n\n### Sub A1\n")
+    assert [(h.level, h.text, h.anchor) for h in headings] == [
+        (1, "Title", "title"),
+        (2, "Section A", "section-a"),
+        (3, "Sub A1", "sub-a1"),
+    ]
+
+
+def test_duplicate_heading_text_gets_a_suffixed_anchor() -> None:
+    headings = extract_headings("## Overview\n\ntext\n\n## Overview\n")
+    assert [h.anchor for h in headings] == ["overview", "overview-2"]
+
+
+def test_heading_with_nothing_sluggable_falls_back_to_position() -> None:
+    headings = extract_headings("## !!!\n")
+    assert headings[0].anchor == "section-1"
+
+
+def test_heading_formatting_marks_are_stripped_from_the_anchor_text() -> None:
+    headings = extract_headings("## Section **Bold** and `code` here\n")
+    assert headings[0].text == "Section Bold and code here"
+
+
+def test_render_stamps_heading_ids_matching_the_outline() -> None:
+    result = _render("## Section A\n\ntext\n")
+    assert result.headings == extract_headings("## Section A\n\ntext\n")
+    assert '<h2 id="section-a">Section A</h2>' in result.html

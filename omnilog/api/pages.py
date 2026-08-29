@@ -17,10 +17,12 @@ from ..schemas import (
     CitationRef,
     DiffResult,
     LinkRef,
+    OutlineItem,
     PageCitations,
     PageCreate,
     PageDetail,
     PageList,
+    PageOutline,
     PageRedirects,
     PageSaved,
     PageSummary,
@@ -31,12 +33,14 @@ from ..schemas import (
     RevertRequest,
     RevisionList,
     RevisionMeta,
+    SectionDetail,
 )
 from ..slug import slugify
 
 router = APIRouter()
 
 SlugPath = Path(min_length=1, max_length=300, description="Page slug")
+AnchorPath = Path(min_length=1, max_length=300, description="Heading anchor")
 
 # Tags double as the MCP scope gate: see omnilog.mcp.restrict_tag wiring.
 EDITOR_TAG = "role-editor"
@@ -343,3 +347,52 @@ def page_backlinks(conn: Conn, slug: str = SlugPath) -> dict:
 def page_citations(conn: Conn, slug: str = SlugPath) -> dict:
     rows, resolved = repository.citations_of(conn, _normalise(slug))
     return {"slug": resolved, "items": [CitationRef(**dict(row)) for row in rows]}
+
+
+@router.get(
+    "/pages/{slug}/outline",
+    response_model=PageOutline,
+    summary="Table of contents",
+    operation_id="page_outline",
+    description=(
+        "Headings only, no body or rendered HTML — cheap to pull before "
+        "deciding whether the whole page, or one section of it, is worth "
+        "reading in full."
+    ),
+    dependencies=_viewer,
+)
+def page_outline(conn: Conn, slug: str = SlugPath) -> dict:
+    headings, resolved = repository.get_outline(conn, _normalise(slug))
+    return {
+        "slug": resolved,
+        "items": [
+            OutlineItem(level=heading.level, text=heading.text, anchor=heading.anchor)
+            for heading in headings
+        ],
+    }
+
+
+@router.get(
+    "/pages/{slug}/sections/{anchor}",
+    response_model=SectionDetail,
+    summary="Read one section",
+    operation_id="read_section",
+    description=(
+        "One heading from the outline and everything under it, up to the "
+        "next heading at the same level or shallower."
+    ),
+    dependencies=_viewer,
+)
+def read_section(
+    conn: Conn, settings: Config, slug: str = SlugPath, anchor: str = AnchorPath
+) -> dict:
+    view = repository.get_section(conn, _normalise(slug), anchor, settings)
+    return {
+        "slug": view.slug,
+        "anchor": view.anchor,
+        "level": view.level,
+        "title": view.title,
+        "content": view.content,
+        "html": view.html,
+        "redirected_from": view.redirected_from,
+    }

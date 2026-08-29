@@ -119,6 +119,19 @@ class Citation(NamedTuple):
     locator: str = ""
 
 
+class Heading(NamedTuple):
+    """One heading, as the outline and section-slicing need it."""
+
+    #: 1-6, straight from the number of leading '#'.
+    level: int
+    #: Plain text, formatting marks stripped.
+    text: str
+    #: Slugified like a page title, deduplicated within the document.
+    anchor: str
+    #: 0-based line the heading starts on, for slicing the raw body by section.
+    line: int
+
+
 @dataclass(frozen=True)
 class Rendered:
     """Result of rendering one body."""
@@ -133,6 +146,8 @@ class Rendered:
     #: Registry key -> fingerprint for every key the body cited, '' when the key
     #: resolved to nothing. What the render cache has to watch.
     sources: Mapping[str, str] = field(default_factory=dict)
+    #: The document's table of contents, in order.
+    headings: tuple[Heading, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -484,6 +499,68 @@ def _citation_list_html(
 
 
 # --------------------------------------------------------------------------
+# headings / outline
+# --------------------------------------------------------------------------
+
+
+def _heading_text(inline: Token) -> str:
+    """Plain text of a heading's inline token, formatting marks stripped.
+
+    Every markdown-it inline rule leaves its content on the open/close tokens
+    empty and puts the actual text on `text` and `code_inline` children, so
+    concatenating every child's content in order reconstructs the heading as a
+    reader would read it aloud, minus the markup characters.
+    """
+    return "".join(child.content for child in inline.children or ())
+
+
+def _collect_headings(tokens: Sequence[Token]) -> tuple[Heading, ...]:
+    """Walk already-parsed `tokens` for headings, in document order.
+
+    A repeated heading text gets `-2`, `-3`, ... appended to stay unique; a
+    heading with nothing sluggable in it (all punctuation, say) falls back to
+    its position instead, the way an empty wikilink target never does either.
+    """
+    seen: dict[str, int] = {}
+    headings: list[Heading] = []
+    for idx, token in enumerate(tokens):
+        if token.type != "heading_open":
+            continue
+        text = _heading_text(tokens[idx + 1])
+        base = slugify(text, strict=False) or f"section-{len(headings) + 1}"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        anchor = base if count == 0 else f"{base}-{count + 1}"
+        headings.append(
+            Heading(
+                level=int(token.tag[1]),
+                text=text,
+                anchor=anchor,
+                line=token.map[0] if token.map else 0,
+            )
+        )
+    return tuple(headings)
+
+
+def _stamp_heading_ids(tokens: Sequence[Token], headings: Sequence[Heading]) -> None:
+    """Give each rendered heading the id its outline entry points at."""
+    ids = iter(headings)
+    for token in tokens:
+        if token.type == "heading_open":
+            token.attrSet("id", next(ids).anchor)
+
+
+def extract_headings(content: str) -> tuple[Heading, ...]:
+    """The table of contents of `content`: one entry per heading, in order.
+
+    Parses but does not render or resolve anything, so a caller can see a
+    document's shape -- and decide whether reading it in full, or one section
+    of it, is worth the tokens -- for the cost of a parse rather than a render.
+    """
+    return _collect_headings(_markdown().parse(content, {}))
+
+
+# --------------------------------------------------------------------------
 # parser
 # --------------------------------------------------------------------------
 
@@ -558,6 +635,9 @@ def render(
     env: dict[str, object] = {}
     tokens = md.parse(content, env)
 
+    headings = _collect_headings(tokens)
+    _stamp_heading_ids(tokens, headings)
+
     found: list[str] = []
     _collect_slugs(tokens, found, set())
     status = dict(resolve(found)) if found else {}
@@ -581,4 +661,5 @@ def render(
         # Missing keys are recorded as '' so registering one later is a change
         # the render cache notices.
         sources={key: sources[key].fingerprint if key in sources else "" for key in keys},
+        headings=headings,
     )

@@ -335,6 +335,30 @@ class BacklinkList(BaseModel):
     items: list[BacklinkRef]
 
 
+class OutlineItem(BaseModel):
+    #: 1-6, straight from the number of leading '#'.
+    level: int
+    text: str
+    #: What `/pages/{slug}/sections/{anchor}` addresses this heading as.
+    anchor: str
+
+
+class PageOutline(BaseModel):
+    slug: str
+    items: list[OutlineItem]
+
+
+class SectionDetail(BaseModel):
+    slug: str
+    anchor: str
+    level: int
+    title: str
+    content: str
+    html: str
+    #: Set when the page was reached through one of its old names.
+    redirected_from: str | None = None
+
+
 class SearchHit(BaseModel):
     slug: str
     title: str

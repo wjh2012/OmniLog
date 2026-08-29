@@ -53,6 +53,8 @@ export OMNILOG_API_KEYS='{"sk-viewer-...": ["viewer"], "sk-admin-...": ["viewer"
 | `POST` | `/api/pages/{slug}/revisions/{n}/revert` | 과거 리비전으로 되돌리기 |
 | `GET` | `/api/pages/{slug}/backlinks` | 이 문서를 가리키는 문서들 |
 | `GET` | `/api/pages/{slug}/citations` | 이 문서가 인용한 출처 목록 |
+| `GET` | `/api/pages/{slug}/outline` | 목차 — 본문·렌더링 없이 헤딩만 |
+| `GET` | `/api/pages/{slug}/sections/{anchor}` | 목차의 헤딩 하나와 그 하위 섹션만 렌더링 |
 | `POST` | `/api/sources` | 출처 등록 |
 | `GET` | `/api/sources?kind=…&host=…&q=…` | 등록된 출처 목록 |
 | `GET` | `/api/sources/{key}` | 출처 조회 |
@@ -342,6 +344,20 @@ script 태그를 밀어넣을 수 없습니다.
 `data-exists`가 붙고, 옛 이름이면 `data-redirect="true"`와 `wikilink-redirect`
 클래스가 추가됩니다. 같은 구분이 각 문서의 `links` 배열에 `exists` / `via_redirect`로
 나옵니다.
+
+## 목차
+
+헤딩(`#`~`######`)마다 제목과 같은 슬러그 변환기로 앵커를 붙입니다. 렌더링된 HTML의
+`<h2 id="설치">`가 그 앵커이고, `/api/pages/{slug}/outline`이 본문·렌더링 없이 헤딩
+목록만 돌려주는 이유는 그걸 얻는 데 페이지 전체를 읽을 필요가 없게 하기 위해서입니다
+— 본문이 커질수록, 특히 MCP로 LLM에 넘길 때 절약되는 토큰이 커집니다.
+
+같은 제목이 두 번 나오면 `overview`, `overview-2`처럼 번호가 붙고, 슬러그로 만들
+글자가 하나도 없는 헤딩(`### !!!`)은 `section-3`처럼 문서 안 위치로 대체됩니다.
+
+목차의 앵커 하나를 골라 `/api/pages/{slug}/sections/{anchor}`로 요청하면 그 헤딩과
+그 아래 하위 헤딩까지만 렌더링해 돌려줍니다 — 다음에 나오는 같은 레벨(또는 더 얕은
+레벨) 헤딩 직전에서 끊깁니다. 위키피디아의 섹션 편집과 같은 경계 규칙입니다.
 
 ## 출처
 

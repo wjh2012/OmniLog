@@ -33,6 +33,16 @@ class RevisionNotFound(WikiError):
         )
 
 
+class SectionNotFound(WikiError):
+    status_code = 404
+    code = "section_not_found"
+
+    def __init__(self, slug: str, anchor: str) -> None:
+        super().__init__(
+            f"Page {slug!r} has no section {anchor!r}.", slug=slug, anchor=anchor
+        )
+
+
 class SlugConflict(WikiError):
     status_code = 409
     code = "slug_conflict"
