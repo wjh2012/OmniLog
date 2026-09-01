@@ -69,7 +69,9 @@ export OMNILOG_API_KEYS='{"sk-viewer-...": ["viewer"], "sk-admin-...": ["viewer"
 | `GET` | `/api/redirects` | 위키 전체의 옛 이름 목록 |
 | `DELETE` | `/api/redirects/{slug}` | 옛 이름 제거 |
 | `GET` | `/api/search?q=…` | 전문 검색 |
+| `GET` | `/api/search/semantic?q=…` | 의미 기반 검색 (임베딩 코사인 유사도) |
 | `POST` | `/api/maintenance/compact` | 오래된 본문을 델타로 재압축 |
+| `POST` | `/api/maintenance/reindex-embeddings` | 누락됐거나 오래된 페이지 임베딩을 다시 계산 |
 
 오류는 `{"code", "message", "details"}` 형태로 돌아오며 상태 코드가 함께 붙습니다.
 `404` 없는 문서·리비전·리다이렉트, `409` 슬러그 중복·편집 충돌·리다이렉트 충돌,
@@ -561,6 +563,67 @@ FTS5의 `trigram` 토크나이저를 씁니다. 부분 문자열 매칭이 되�
 
 사용자 입력은 `MATCH`에 닿기 전에 인용부호로 감쌉니다. 쿼리에 섞인 FTS5 연산자가
 오류를 내거나 검색 의미를 바꾸지 않고 문자 그대로 처리됩니다.
+
+## 시맨틱 검색
+
+trigram은 **글자가 겹치는지**만 봅니다. "실행 취소"로 검색하면 본문에 "undo"라고만
+적힌 문서는 찾지 못합니다. `/api/search/semantic`은 임베딩 벡터의 코사인 유사도로
+**의미가 비슷한지**를 봐서 이 틈을 메웁니다.
+
+### 제공자는 갈아 끼우는 부품
+
+`omnilog/embeddings/base.py`의 `EmbeddingProvider`가 계약의 전부입니다 —
+`embed_documents(texts)`와 `embed_query(text)` 두 메서드뿐입니다. 이 둘을 나눠둔
+이유는 일부 모델(특히 instruction-tuned 모델)이 쿼리와 문서를 다르게 다뤄야 하기
+때문입니다 — 예를 들어 쿼리에만 지시문을 붙이는 식. 그 차이는 구현체 안에 갇혀
+있고, 호출하는 쪽은 몰라도 됩니다.
+
+기본 구현은 `omnilog/embeddings/openai.py`의 OpenAI API 클라이언트입니다.
+`OMNILOG_EMBEDDING_BASE_URL`을 OpenAI 호환 로컬 서버(vLLM, TEI, Ollama 등)로 돌리면
+코드 변경 없이 로컬 오픈소스 모델로 옮겨갈 수 있습니다 — 단, 프리픽스 방식이 다른
+모델(예: Qwen3-Embedding 계열)로 완전히 갈아탈 때는 그 모델 전용
+`EmbeddingProvider` 구현체를 하나 추가하는 편이 낫습니다.
+
+```bash
+export OMNILOG_EMBEDDING_PROVIDER=openai        # 지금은 이거 하나뿐
+export OMNILOG_EMBEDDING_MODEL=text-embedding-3-small
+export OMNILOG_EMBEDDING_DIMENSIONS=1536
+export OMNILOG_EMBEDDING_BASE_URL=              # 비우면 OpenAI 공식 엔드포인트
+export OMNILOG_EMBEDDING_API_KEY=               # 비우면 OPENAI_API_KEY 사용
+```
+
+### 저장과 무효화
+
+`page_embedding`은 `(page_id, anchor)`로 키잉됩니다. `anchor`는 지금은 항상 `''`
+(페이지 전체 한 청크)지만, 나중에 섹션 단위로 쪼개도 스키마를 바꿀 필요가
+없습니다. `render_cache`가 `link_state`/`cite_state`로 캐시가 무엇을 기준으로
+만들어졌는지 남기는 것과 같은 이유로, 모든 행에 `model_id`·`dimensions`를 함께
+찍어둡니다. 모델을 바꾸면 기존 벡터가 자동으로 "낡은" 것으로 판정되고, 검색도
+현재 모델의 벡터만 골라서 봅니다 — 서로 다른 모델의 벡터를 한 결과에 섞는 일은
+없습니다.
+
+`rev_id`가 아니라 `page_id`로 키잉한 것도 의도적입니다. 이름 변경은 `page.slug`만
+바꾸고 `page.id`는 그대로 두므로, rename 뒤에도 재인덱싱 없이 그대로 검색됩니다 —
+[정체성과 주소는 다르다](#정체성과-주소는-다르다)와 같은 설계입니다. 편집만 새
+`rev_id`를 만들어 벡터를 낡게 만듭니다.
+
+### 편집 경로에 넣지 않은 이유
+
+`create_page`/`update_page`는 임베딩을 계산하지 않습니다. 임베딩은 외부(지금은
+OpenAI)로 나가는 HTTP 호출이고, 이 프로젝트는 [출처의 링크 생존 여부를 확인하지
+않는 것](#만들지-않은-것)과 같은 이유로 편집 경로에 외부 의존성을 넣지 않습니다.
+대신 `POST /api/maintenance/reindex-embeddings`를 명시적으로 호출합니다 —
+`compact`처럼 오프라인 유지보수 작업입니다. 이미 최신인 페이지는 건드리지 않으므로
+언제 다시 돌려도 안전하고, 페이지마다 개별 트랜잭션으로 커밋되므로 중간에 실패해도
+그때까지 인덱싱된 페이지는 남습니다.
+
+### 검색은 브루트포스
+
+전용 벡터 인덱스 없이 저장된 벡터를 전부 훑어 코사인 유사도로 정렬합니다
+(`omnilog/vectorstore.py`). trigram 인덱스가 거는 것과 같은 규모 내기입니다 —
+위키가 SQLite에 편하게 들어가는 동안은 문제없고, 코퍼스가 커지면 이 모듈을
+sqlite-vec이나 Qdrant 같은 전용 벡터 인덱스로 바꾸면 됩니다. 호출하는 쪽은
+`(row, score)` 쌍만 다루므로 바뀌는 걸 모릅니다.
 
 ## 동시성
 

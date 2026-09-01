@@ -376,6 +376,34 @@ class SearchResult(BaseModel):
     items: list[SearchHit]
 
 
+class SemanticHit(BaseModel):
+    slug: str
+    title: str
+    updated_at: str
+    #: Prefix of the chunk that was embedded, for a human to sanity-check the match.
+    excerpt: str
+    #: Cosine similarity to the query, 1.0 is identical, higher is more similar.
+    score: float
+
+
+class SemanticSearchResult(BaseModel):
+    query: str
+    #: Which model produced these results -- vectors from another model are
+    #: never mixed in, so this also tells the caller what was searched.
+    model_id: str
+    limit: int
+    items: list[SemanticHit]
+
+
+class EmbeddingReindexResult(BaseModel):
+    #: Pages considered.
+    pages: int
+    #: Pages whose embedding was missing or stale and got (re)computed.
+    updated: int
+    model_id: str
+    dimensions: int
+
+
 class CompactResult(BaseModel):
     pages: int
     #: Bodies re-encoded as deltas by this run.

@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from . import markup
+from . import markup, vectorstore
 from .config import Settings
 from .db import write_tx
+from .embeddings.base import EmbeddingProvider
 from .errors import (
     ContentTooLarge,
     EditConflict,
+    EmbeddingUnavailable,
     FileNotAttached,
     FileTooLarge,
     InvalidSource,
@@ -1707,3 +1709,149 @@ def search(
 def highlight_to_html(snippet: str) -> str:
     """Escape a snippet, then turn the internal markers into <mark> tags."""
     return html.escape(snippet).replace(_HL_OPEN, "<mark>").replace(_HL_CLOSE, "</mark>")
+
+
+# --------------------------------------------------------------------------
+# semantic search (see omnilog/embeddings and omnilog/vectorstore)
+# --------------------------------------------------------------------------
+
+#: Characters sent to the embedding provider per page. A generous safety rail
+#: well under typical provider context limits, not real chunking -- splitting
+#: a page into several embedded sections is future work, not done here (the
+#: page_embedding schema already has room for it via its `anchor` column).
+_MAX_EMBEDDING_CHARS = 24000
+
+
+def _embedding_stale(row: sqlite3.Row | None, rev_id: int, provider: EmbeddingProvider) -> bool:
+    """A row is stale once its page has moved on, or the model/provider has.
+
+    Mirrors why render_cache checks link_state/cite_state on every read: the
+    stored answer must be told apart from an answer to a different question,
+    not just from "no answer yet".
+    """
+    return (
+        row is None
+        or row["rev_id"] != rev_id
+        or row["model_id"] != provider.model_id
+        or row["dimensions"] != provider.dimensions
+    )
+
+
+def index_page_embedding(
+    conn: sqlite3.Connection, page_id: int, provider: EmbeddingProvider
+) -> bool:
+    """(Re)compute a page's embedding if it is missing or stale.
+
+    Called from reindex_embeddings, never from create_page/update_page: an
+    embedding call is outbound HTTP to whatever the provider is, and this
+    project keeps that kind of dependency out of the write path on purpose
+    (the same reasoning as citation link-rot checks -- see the README).
+    """
+    page = conn.execute(
+        "SELECT id, latest_rev_id FROM page WHERE id = ?", (page_id,)
+    ).fetchone()
+    if page is None or page["latest_rev_id"] is None:
+        return False
+    rev_id = page["latest_rev_id"]
+
+    existing = conn.execute(
+        "SELECT rev_id, model_id, dimensions FROM page_embedding "
+        "WHERE page_id = ? AND anchor = ''",
+        (page_id,),
+    ).fetchone()
+    if not _embedding_stale(existing, rev_id, provider):
+        return False
+
+    revision = conn.execute(
+        "SELECT text_id FROM revision WHERE id = ?", (rev_id,)
+    ).fetchone()
+    chunk = load_text(conn, revision["text_id"])[:_MAX_EMBEDDING_CHARS]
+    try:
+        (vector,) = provider.embed_documents([chunk])
+    except EmbeddingUnavailable:
+        raise
+    except Exception as exc:  # provider SDKs each raise their own types
+        raise EmbeddingUnavailable(str(exc)) from exc
+
+    conn.execute(
+        """
+        INSERT INTO page_embedding
+            (page_id, anchor, rev_id, chunk_text, embedding, model_id, dimensions, created_at)
+        VALUES (?, '', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (page_id, anchor) DO UPDATE SET
+            rev_id = excluded.rev_id,
+            chunk_text = excluded.chunk_text,
+            embedding = excluded.embedding,
+            model_id = excluded.model_id,
+            dimensions = excluded.dimensions,
+            created_at = excluded.created_at
+        """,
+        (
+            page_id,
+            rev_id,
+            chunk,
+            vectorstore.pack(vector),
+            provider.model_id,
+            provider.dimensions,
+            _now(),
+        ),
+    )
+    return True
+
+
+def reindex_embeddings(
+    conn: sqlite3.Connection, provider: EmbeddingProvider, *, limit: int | None = None
+) -> dict[str, object]:
+    """(Re)compute every page's embedding that is missing or stale.
+
+    Each page commits in its own transaction, so a provider failure partway
+    through a large wiki leaves the pages already indexed in place rather
+    than rolling everything back. Safe to re-run any time -- rows that are
+    already current under the configured model are left untouched. Mirrors
+    compact_all in spirit: explicit, offline upkeep, not part of the edit path.
+    """
+    page_ids = [row["id"] for row in conn.execute("SELECT id FROM page ORDER BY id")]
+    if limit is not None:
+        page_ids = page_ids[:limit]
+    updated = 0
+    for page_id in page_ids:
+        with write_tx(conn):
+            if index_page_embedding(conn, page_id, provider):
+                updated += 1
+    return {
+        "pages": len(page_ids),
+        "updated": updated,
+        "model_id": provider.model_id,
+        "dimensions": provider.dimensions,
+    }
+
+
+def semantic_search(
+    conn: sqlite3.Connection, query: str, provider: EmbeddingProvider, limit: int
+) -> list[tuple[sqlite3.Row, float]]:
+    """Rank pages by cosine similarity to `query`.
+
+    Only rows stamped with the *current* provider's model_id/dimensions are
+    considered -- comparing vectors from two different models would produce
+    numbers that look like scores but mean nothing next to each other.
+    """
+    query = query.strip()
+    if not query:
+        return []
+    try:
+        vector = provider.embed_query(query)
+    except EmbeddingUnavailable:
+        raise
+    except Exception as exc:
+        raise EmbeddingUnavailable(str(exc)) from exc
+
+    rows = conn.execute(
+        """
+        SELECT pe.page_id, pe.anchor, pe.chunk_text, pe.embedding,
+               p.slug, p.title, p.updated_at
+        FROM page_embedding pe JOIN page p ON p.id = pe.page_id
+        WHERE pe.model_id = ? AND pe.dimensions = ?
+        """,
+        (provider.model_id, provider.dimensions),
+    ).fetchall()
+    return vectorstore.rank_by_similarity(vector, rows, limit=limit)

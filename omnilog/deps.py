@@ -11,6 +11,8 @@ from fastapi import Depends, HTTPException, Request, status
 from .auth import has_role
 from .config import Settings
 from .db import connect
+from .embeddings import EmbeddingProvider, get_embedding_provider
+from .errors import EmbeddingUnavailable
 
 
 def get_settings(request: Request) -> Settings:
@@ -26,8 +28,25 @@ def get_conn(request: Request) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def get_embedder(settings: Settings = Depends(get_settings)) -> EmbeddingProvider:
+    """One provider instance per request -- cheap; it just wraps an HTTP client.
+
+    Construction itself can fail (e.g. the OpenAI SDK raises immediately when
+    no API key is configured), so that failure is caught here and turned into
+    the same WikiError shape every other route error takes, rather than
+    surfacing as a bare 500.
+    """
+    try:
+        return get_embedding_provider(settings)
+    except EmbeddingUnavailable:
+        raise
+    except Exception as exc:
+        raise EmbeddingUnavailable(str(exc)) from exc
+
+
 Conn = Annotated[sqlite3.Connection, Depends(get_conn)]
 Config = Annotated[Settings, Depends(get_settings)]
+Embedder = Annotated[EmbeddingProvider, Depends(get_embedder)]
 
 
 def require_role(role: str):
