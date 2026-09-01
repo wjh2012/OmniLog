@@ -79,6 +79,7 @@ def semantic_search(
                 slug=row["slug"],
                 title=row["title"],
                 updated_at=row["updated_at"],
+                anchor=row["anchor"],
                 excerpt=row["chunk_text"][:_EXCERPT_CHARS],
                 score=score,
             )

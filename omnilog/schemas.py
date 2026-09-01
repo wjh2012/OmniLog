@@ -380,6 +380,10 @@ class SemanticHit(BaseModel):
     slug: str
     title: str
     updated_at: str
+    #: Which chunk matched: '' for the page's lead (before its first heading,
+    #: or the whole body if it has none), otherwise a section anchor usable
+    #: with GET /pages/{slug}/sections/{anchor}.
+    anchor: str
     #: Prefix of the chunk that was embedded, for a human to sanity-check the match.
     excerpt: str
     #: Cosine similarity to the query, 1.0 is identical, higher is more similar.

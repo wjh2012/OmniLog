@@ -109,3 +109,43 @@ def test_semantic_search_embeds_current_body_not_html(client, make_page, fake_em
     make_page("Wiki System", "**wiki** _content_")
     _reindex(client)
     assert fake_embedder.embedded == ["**wiki** _content_"]
+
+
+def test_multi_section_page_gets_one_chunk_per_heading(client, make_page) -> None:
+    """A page mixing topics under different headings must not blend into one
+    vector -- each heading is embedded (and so searchable) on its own.
+    """
+    make_page("Travel Notes", "## Tokyo\nwiki notes about tokyo\n\n## Cats\ncat notes here")
+    _reindex(client)
+
+    result = _semantic(client, "cat")
+    assert result["items"][0]["slug"] == "travel-notes"
+    assert result["items"][0]["anchor"] == "cats"
+    assert result["items"][0]["score"] == pytest.approx(1.0)
+    # The unrelated section of the same page must not tie for first place.
+    assert result["items"][1]["anchor"] == "tokyo"
+    assert result["items"][1]["score"] == pytest.approx(0.0)
+
+
+def test_lead_text_before_first_heading_gets_its_own_chunk(client, make_page) -> None:
+    make_page("Notes", "intro mentions wiki here.\n\n## Cats\ncat notes")
+    _reindex(client)
+
+    result = _semantic(client, "wiki")
+    assert result["items"][0]["anchor"] == ""
+    assert "wiki" in result["items"][0]["excerpt"]
+
+
+def test_reindex_replaces_the_whole_chunk_set_when_headings_change(client, make_page) -> None:
+    make_page("Travel Notes", "## Tokyo\nwiki notes\n\n## Cats\ncat notes")
+    _reindex(client)
+    assert {item["anchor"] for item in _semantic(client, "cat")["items"]} == {"tokyo", "cats"}
+
+    client.put("/api/pages/travel-notes", json={"content": "## Tokyo\nwiki notes only now"})
+    _reindex(client)
+
+    result = _semantic(client, "cat")
+    # The removed section's chunk must not survive as an orphan row -- only
+    # the still-current "tokyo" chunk is left to score (at 0.0, unrelated).
+    assert [item["anchor"] for item in result["items"]] == ["tokyo"]
+    assert result["items"][0]["score"] == pytest.approx(0.0)

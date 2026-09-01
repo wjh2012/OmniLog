@@ -1715,11 +1715,44 @@ def highlight_to_html(snippet: str) -> str:
 # semantic search (see omnilog/embeddings and omnilog/vectorstore)
 # --------------------------------------------------------------------------
 
-#: Characters sent to the embedding provider per page. A generous safety rail
-#: well under typical provider context limits, not real chunking -- splitting
-#: a page into several embedded sections is future work, not done here (the
-#: page_embedding schema already has room for it via its `anchor` column).
+#: Characters sent to the embedding provider per chunk. A generous safety
+#: rail well under typical provider context limits -- sections are usually
+#: far smaller than this, so it only bites a pathological one.
 _MAX_EMBEDDING_CHARS = 24000
+
+
+def _heading_chunks(content: str) -> list[tuple[str, str]]:
+    """Split a body into (anchor, chunk_text) pairs at heading boundaries.
+
+    Each heading owns the text up to the *next* heading, at any level --
+    unlike get_section's "next same-or-shallower" rule, which deliberately
+    includes subsections (an editable unit should carry its children).
+    Chunks here must NOT overlap, or the same sentence would be embedded
+    twice and could win a search result twice under two different anchors.
+
+    Content before the first heading -- or the whole body, for a page with
+    none -- gets anchor '', the same anchor a whole-page embedding used
+    before chunking existed. A page with no heading text at all still comes
+    back as one '' chunk, so a short, headingless page keeps working exactly
+    as it did.
+    """
+    headings = markup.extract_headings(content)
+    if not headings:
+        return [("", content)] if content.strip() else []
+
+    lines = content.splitlines()
+    chunks: list[tuple[str, str]] = []
+    if headings[0].line > 0:
+        lead = "\n".join(lines[: headings[0].line]).strip()
+        if lead:
+            chunks.append(("", lead))
+
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].line if index + 1 < len(headings) else len(lines)
+        text = "\n".join(lines[heading.line : end]).strip()
+        if text:
+            chunks.append((heading.anchor, text))
+    return chunks
 
 
 def _embedding_stale(row: sqlite3.Row | None, rev_id: int, provider: EmbeddingProvider) -> bool:
@@ -1727,7 +1760,9 @@ def _embedding_stale(row: sqlite3.Row | None, rev_id: int, provider: EmbeddingPr
 
     Mirrors why render_cache checks link_state/cite_state on every read: the
     stored answer must be told apart from an answer to a different question,
-    not just from "no answer yet".
+    not just from "no answer yet". Checking one row is enough even though a
+    page now has many -- index_page_embedding always (re)writes a page's
+    whole chunk set together, so every row it owns shares one rev_id/model.
     """
     return (
         row is None
@@ -1740,12 +1775,18 @@ def _embedding_stale(row: sqlite3.Row | None, rev_id: int, provider: EmbeddingPr
 def index_page_embedding(
     conn: sqlite3.Connection, page_id: int, provider: EmbeddingProvider
 ) -> bool:
-    """(Re)compute a page's embedding if it is missing or stale.
+    """(Re)compute a page's embeddings if they are missing or stale.
 
     Called from reindex_embeddings, never from create_page/update_page: an
     embedding call is outbound HTTP to whatever the provider is, and this
     project keeps that kind of dependency out of the write path on purpose
     (the same reasoning as citation link-rot checks -- see the README).
+
+    Chunks are one per heading (see _heading_chunks) and are replaced
+    wholesale -- headings can be added, removed or renamed between
+    revisions, so patching individual anchors in place would leave orphaned
+    or mismatched rows behind. Mirrors _index_page's delete-then-insert for
+    page_fts, for the same reason.
     """
     page = conn.execute(
         "SELECT id, latest_rev_id FROM page WHERE id = ?", (page_id,)
@@ -1755,8 +1796,7 @@ def index_page_embedding(
     rev_id = page["latest_rev_id"]
 
     existing = conn.execute(
-        "SELECT rev_id, model_id, dimensions FROM page_embedding "
-        "WHERE page_id = ? AND anchor = ''",
+        "SELECT rev_id, model_id, dimensions FROM page_embedding WHERE page_id = ? LIMIT 1",
         (page_id,),
     ).fetchone()
     if not _embedding_stale(existing, rev_id, provider):
@@ -1765,37 +1805,39 @@ def index_page_embedding(
     revision = conn.execute(
         "SELECT text_id FROM revision WHERE id = ?", (rev_id,)
     ).fetchone()
-    chunk = load_text(conn, revision["text_id"])[:_MAX_EMBEDDING_CHARS]
-    try:
-        (vector,) = provider.embed_documents([chunk])
-    except EmbeddingUnavailable:
-        raise
-    except Exception as exc:  # provider SDKs each raise their own types
-        raise EmbeddingUnavailable(str(exc)) from exc
+    content = load_text(conn, revision["text_id"])
+    chunks = [(anchor, text[:_MAX_EMBEDDING_CHARS]) for anchor, text in _heading_chunks(content)]
 
-    conn.execute(
-        """
-        INSERT INTO page_embedding
-            (page_id, anchor, rev_id, chunk_text, embedding, model_id, dimensions, created_at)
-        VALUES (?, '', ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (page_id, anchor) DO UPDATE SET
-            rev_id = excluded.rev_id,
-            chunk_text = excluded.chunk_text,
-            embedding = excluded.embedding,
-            model_id = excluded.model_id,
-            dimensions = excluded.dimensions,
-            created_at = excluded.created_at
-        """,
-        (
-            page_id,
-            rev_id,
-            chunk,
-            vectorstore.pack(vector),
-            provider.model_id,
-            provider.dimensions,
-            _now(),
-        ),
-    )
+    conn.execute("DELETE FROM page_embedding WHERE page_id = ?", (page_id,))
+    if chunks:
+        try:
+            vectors = provider.embed_documents([text for _, text in chunks])
+        except EmbeddingUnavailable:
+            raise
+        except Exception as exc:  # provider SDKs each raise their own types
+            raise EmbeddingUnavailable(str(exc)) from exc
+
+        now = _now()
+        conn.executemany(
+            """
+            INSERT INTO page_embedding
+                (page_id, anchor, rev_id, chunk_text, embedding, model_id, dimensions, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    page_id,
+                    anchor,
+                    rev_id,
+                    text,
+                    vectorstore.pack(vector),
+                    provider.model_id,
+                    provider.dimensions,
+                    now,
+                )
+                for (anchor, text), vector in zip(chunks, vectors, strict=True)
+            ],
+        )
     return True
 
 
