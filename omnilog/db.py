@@ -169,6 +169,28 @@ CREATE TABLE IF NOT EXISTS render_cache (
     cite_state TEXT NOT NULL,   -- fingerprint of the registered sources they resolved to
     created_at TEXT NOT NULL
 );
+
+-- Vector index for semantic search (see omnilog/vectorstore.py). One row per
+-- (page, anchor); anchor is '' for the whole page today -- section-level
+-- chunks can land here later without a schema change. model_id/dimensions are
+-- stamped on every row for the same reason link_state/cite_state exist on
+-- render_cache: a provider or model swap must be told apart from a merely
+-- stale row, never silently mixed into the same search. Keyed by page_id, not
+-- rev_id, so a rename (which never touches page_id) leaves embeddings valid;
+-- only an edit (a new rev_id) makes a row stale.
+CREATE TABLE IF NOT EXISTS page_embedding (
+    page_id    INTEGER NOT NULL REFERENCES page(id) ON DELETE CASCADE,
+    anchor     TEXT NOT NULL DEFAULT '',
+    rev_id     INTEGER NOT NULL REFERENCES revision(id) ON DELETE CASCADE,
+    chunk_text TEXT NOT NULL,
+    embedding  BLOB NOT NULL,    -- little-endian float32, `dimensions` long
+    model_id   TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (page_id, anchor)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_page_embedding_model ON page_embedding (model_id);
 """
 
 # Created separately so the tokenizer can be probed first.

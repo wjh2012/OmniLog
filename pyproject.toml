@@ -6,6 +6,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "fastmcp>=3.4.7",
     "markdown-it-py>=4.2.0",
+    "openai>=1.50",
     "pydantic-ai>=2.22.0",
     "uvicorn>=0.52.1",
 ]

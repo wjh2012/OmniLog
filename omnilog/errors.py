@@ -147,3 +147,13 @@ class FileTooLarge(WikiError):
         super().__init__(
             f"Upload is {size} bytes, over the {limit} byte limit.", size=size, limit=limit
         )
+
+
+class EmbeddingUnavailable(WikiError):
+    """The configured embedding provider rejected a call or is unreachable."""
+
+    status_code = 502
+    code = "embedding_unavailable"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Embedding provider call failed: {reason}", reason=reason)

@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, Query
 
 from .. import repository
 from ..auth import ADMIN
-from ..deps import Config, Conn, require_role
-from ..schemas import CompactResult
+from ..deps import Config, Conn, Embedder, require_role
+from ..schemas import CompactResult, EmbeddingReindexResult
 
 router = APIRouter()
 
@@ -55,3 +55,29 @@ def compact(
         "file_before": file_before,
         "file_after": file_after,
     }
+
+
+@router.post(
+    "/maintenance/reindex-embeddings",
+    response_model=EmbeddingReindexResult,
+    summary="(Re)compute embeddings for pages that are missing one or out of date",
+    operation_id="reindex_embeddings",
+    tags=[ADMIN_TAG],
+    dependencies=[Depends(require_role(ADMIN))],
+)
+def reindex_embeddings(
+    conn: Conn,
+    embedder: Embedder,
+    limit: int | None = Query(
+        default=None, ge=1, description="Cap how many pages this call processes."
+    ),
+) -> dict:
+    """Bring `page_embedding` up to date under the currently configured model.
+
+    Calls out to the embedding provider once per stale page, so unlike
+    /maintenance/compact this is not free of external dependencies -- run it
+    after edits, or after switching OMNILOG_EMBEDDING_* to a different model
+    (every page looks stale to the new model and gets recomputed). Already
+    current rows are left alone, so it is always safe to re-run.
+    """
+    return repository.reindex_embeddings(conn, embedder, limit=limit)
