@@ -399,6 +399,41 @@ class SemanticSearchResult(BaseModel):
     items: list[SemanticHit]
 
 
+class HybridHit(BaseModel):
+    slug: str
+    title: str
+    updated_at: str
+    #: Which retrievers placed this page: "text" (trigram, or the LIKE
+    #: fallback) and/or "semantic". Both means they agreed.
+    matched_by: list[str]
+    #: Reciprocal-rank-fusion score, higher is better. Built from rank
+    #: positions rather than from BM25 or cosine numbers, so it is comparable
+    #: only against the other hits in this same response.
+    score: float
+    #: 1-based place in the text ranking, or null if text search missed it.
+    text_rank: int | None
+    #: 1-based place in the semantic ranking, or null if it missed it.
+    semantic_rank: int | None
+    #: HTML-escaped excerpt with matches in <mark>; null without a text match.
+    snippet: str | None
+    #: Section anchor of the chunk that matched semantically, usable with
+    #: GET /pages/{slug}/sections/{anchor}; null without a semantic match.
+    anchor: str | None
+    #: Plain-text prefix of that chunk; null without a semantic match.
+    excerpt: str | None
+
+
+class HybridSearchResult(BaseModel):
+    query: str
+    limit: int
+    #: Model behind the semantic half, or null when that half did not run --
+    #: no provider configured, or the provider call failed. Results are then
+    #: text-only rather than an error, so check this before reading a miss as
+    #: "nothing means this".
+    model_id: str | None
+    items: list[HybridHit]
+
+
 class EmbeddingReindexResult(BaseModel):
     #: Pages considered.
     pages: int

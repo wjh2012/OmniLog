@@ -44,9 +44,25 @@ def get_embedder(settings: Settings = Depends(get_settings)) -> EmbeddingProvide
         raise EmbeddingUnavailable(str(exc)) from exc
 
 
+def get_optional_embedder(
+    settings: Settings = Depends(get_settings),
+) -> EmbeddingProvider | None:
+    """`get_embedder`, but None instead of an error when none can be built.
+
+    For routes that still have an answer without embeddings -- hybrid search
+    falls back to its text half -- so an unconfigured or broken provider
+    degrades the result rather than failing the request.
+    """
+    try:
+        return get_embedding_provider(settings)
+    except Exception:
+        return None
+
+
 Conn = Annotated[sqlite3.Connection, Depends(get_conn)]
 Config = Annotated[Settings, Depends(get_settings)]
 Embedder = Annotated[EmbeddingProvider, Depends(get_embedder)]
+OptionalEmbedder = Annotated[EmbeddingProvider | None, Depends(get_optional_embedder)]
 
 
 def require_role(role: str):

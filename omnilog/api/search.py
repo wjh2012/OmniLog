@@ -1,4 +1,4 @@
-"""Full-text search route."""
+"""Search routes: text, semantic, and the two fused."""
 
 from __future__ import annotations
 
@@ -6,8 +6,15 @@ from fastapi import APIRouter, Depends, Query
 
 from .. import repository
 from ..auth import VIEWER
-from ..deps import Conn, Embedder, require_role
-from ..schemas import SearchHit, SearchResult, SemanticHit, SemanticSearchResult
+from ..deps import Conn, Embedder, OptionalEmbedder, require_role
+from ..schemas import (
+    HybridHit,
+    HybridSearchResult,
+    SearchHit,
+    SearchResult,
+    SemanticHit,
+    SemanticSearchResult,
+)
 
 router = APIRouter()
 
@@ -84,5 +91,60 @@ def semantic_search(
                 score=score,
             )
             for row, score in hits
+        ],
+    }
+
+
+@router.get(
+    "/search/hybrid",
+    response_model=HybridSearchResult,
+    summary="Search pages by words and by meaning at once",
+    operation_id="hybrid_search_pages",
+    dependencies=[Depends(require_role(VIEWER))],
+)
+def hybrid_search(
+    conn: Conn,
+    embedder: OptionalEmbedder,
+    q: str = Query(min_length=1, max_length=2000, description="Search text"),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict:
+    """`/search` and `/search/semantic` fused into one ranking.
+
+    The two miss in opposite directions: trigram cannot match a synonym it
+    never sees, and cosine similarity is vague about an exact string -- a
+    product name or an error code that has to match character for character.
+    Reciprocal Rank Fusion merges them on rank position, so a page both
+    rankings place well beats one that only a single ranking loved.
+
+    No `offset`: past the fusion depth the merged order stops meaning
+    anything, so this endpoint pages no further than `limit`.
+    """
+    result = repository.hybrid_search(conn, q, embedder, limit)
+    return {
+        "query": q,
+        "limit": limit,
+        "model_id": result["model_id"],
+        "items": [
+            HybridHit(
+                slug=item["slug"],
+                title=item["title"],
+                updated_at=item["updated_at"],
+                matched_by=item["matched_by"],
+                score=item["score"],
+                text_rank=item["text_rank"],
+                semantic_rank=item["semantic_rank"],
+                snippet=(
+                    repository.highlight_to_html(item["snippet"])
+                    if item["snippet"] is not None
+                    else None
+                ),
+                anchor=item["anchor"],
+                excerpt=(
+                    item["chunk_text"][:_EXCERPT_CHARS]
+                    if item["chunk_text"] is not None
+                    else None
+                ),
+            )
+            for item in result["items"]
         ],
     }

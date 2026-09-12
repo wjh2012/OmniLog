@@ -1897,3 +1897,133 @@ def semantic_search(
         (provider.model_id, provider.dimensions),
     ).fetchall()
     return vectorstore.rank_by_similarity(vector, rows, limit=limit)
+
+
+# --------------------------------------------------------------------------
+# hybrid search (the two rankings above, fused)
+# --------------------------------------------------------------------------
+
+#: Reciprocal Rank Fusion's damping constant, 60 as in Cormack et al. (2009).
+#: It sets how steeply a rank's contribution decays: large enough that the gap
+#: between rank 1 and rank 2 cannot swamp a page both retrievers agree on
+#: further down, small enough that position still decides.
+_RRF_K = 60
+
+
+#: Chunks read per page slot wanted from the semantic half. That half ranks
+#: chunks, and one long page can own a dozen of them, so asking for exactly
+#: `_candidate_depth` chunks could collapse to a handful of distinct pages and
+#: quietly leave the semantic side shallower than the text side.
+_CHUNKS_PER_PAGE = 5
+
+
+def _candidate_depth(limit: int) -> int:
+    """How deep to read each retriever before fusing.
+
+    Deeper than `limit`, because a page sitting 20th in both rankings can
+    legitimately outrank one that only a single retriever found at all --
+    fusing just the top `limit` of each would never see it.
+    """
+    return max(limit * 4, 20)
+
+
+def hybrid_search(
+    conn: sqlite3.Connection,
+    query: str,
+    provider: EmbeddingProvider | None,
+    limit: int,
+) -> dict[str, object]:
+    """Fuse the trigram and semantic rankings with Reciprocal Rank Fusion.
+
+    RRF scores a page by where it *placed*, not by what either retriever
+    scored it: `sum(1 / (k + rank))` over the rankings it appears in. That
+    sidesteps the fact that BM25 (unbounded, lower is better) and cosine
+    similarity (0..1, higher is better) are not on any shared scale, and it
+    survives `search`'s LIKE fallback handing back no score at all.
+
+    `provider` may be None, and an unreachable one is caught rather than
+    raised: search is a read path, so a missing API key degrades this to the
+    text half instead of failing the request. The caller can tell which
+    happened -- `model_id` comes back None when the semantic half did not run.
+    """
+    query = query.strip()
+    if not query:
+        return {"model_id": None, "items": []}
+
+    depth = _candidate_depth(limit)
+    text_hits = search(conn, query, depth, 0)
+
+    model_id: str | None = None
+    semantic_hits: list[tuple[sqlite3.Row, float]] = []
+    if provider is not None:
+        try:
+            semantic_hits = semantic_search(
+                conn, query, provider, depth * _CHUNKS_PER_PAGE
+            )
+        except EmbeddingUnavailable:
+            semantic_hits = []
+        else:
+            model_id = provider.model_id
+
+    entries: dict[str, dict[str, object]] = {}
+
+    for rank, hit in enumerate(text_hits, start=1):
+        entries[hit["slug"]] = {
+            "slug": hit["slug"],
+            "title": hit["title"],
+            "updated_at": hit["updated_at"],
+            "snippet": hit["snippet"],
+            "anchor": None,
+            "chunk_text": None,
+            "text_rank": rank,
+            "semantic_rank": None,
+        }
+
+    # Semantic search ranks chunks, fusion ranks pages: keep each page's best
+    # chunk and drop the rest. The anchor survives, so a caller can still open
+    # the section that matched, but one page cannot hold two fused slots --
+    # which would also let it collect the 1/(k+rank) bonus twice.
+    seen: set[str] = set()
+    rank = 0
+    for row, score in semantic_hits:
+        # A cosine of zero or less is the one reading that means the same
+        # thing under every model -- no shared direction at all -- so cutting
+        # there is not the score calibration RRF exists to avoid. Without it
+        # the brute-force scan hands a fused rank to every page in the wiki,
+        # and an unrelated page would push out a real text hit.
+        if score <= 0.0:
+            break
+        slug = row["slug"]
+        if slug in seen:
+            continue
+        seen.add(slug)
+        rank += 1
+        entry = entries.get(slug)
+        if entry is None:
+            entry = entries[slug] = {
+                "slug": row["slug"],
+                "title": row["title"],
+                "updated_at": row["updated_at"],
+                "snippet": None,
+                "anchor": None,
+                "chunk_text": None,
+                "text_rank": None,
+                "semantic_rank": None,
+            }
+        entry["anchor"] = row["anchor"]
+        entry["chunk_text"] = row["chunk_text"]
+        entry["semantic_rank"] = rank
+
+    for entry in entries.values():
+        ranks = (("text", entry["text_rank"]), ("semantic", entry["semantic_rank"]))
+        entry["matched_by"] = [name for name, position in ranks if position is not None]
+        entry["score"] = sum(
+            1.0 / (_RRF_K + position) for _, position in ranks if position is not None
+        )
+
+    # Slug breaks ties, so a fused score shared by two pages still orders the
+    # same way on every call. RRF ties are routine, not a corner case: a page
+    # only text found at rank 1 and a page only semantic found at rank 1 both
+    # score exactly 1/(k+1).
+    ranked = sorted(entries.values(), key=lambda entry: (-entry["score"], entry["slug"]))
+    return {"model_id": model_id, "items": ranked[:limit]}
